@@ -1,0 +1,1 @@
+# Log file for block residual, projections violations, eta curve and time consuming.

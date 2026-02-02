@@ -18,6 +18,9 @@ We define the necessary interface and inner optimiazation process of inner CADMM
     * dual state
 - interface:
     * selected cell
+
+Update:
+Inner solver 不应该依赖外部可变对象（env_state、robot 类实例），而应该只依赖一个 CadmmProblem 快照
 """
 from dataclasses import dataclass
 import numpy as np
@@ -29,6 +32,9 @@ from scripts.environment.communication import LinkState, estimate_link_state
 from scripts.environment.robot import UAV, UGV, enumerate_candidate_moves
 from scripts.environment.grid_map import estimate_new_unknown_cells, compute_frontier_entropy, predict_coverage_after_moves
 from scripts.utils.helper import compute_current_coverage_ratio, entropy_potential_at_pos, update_repulsion_grad, role_priority
+# new added at 20260202
+from scripts.core.data import FeatureFlags, CadmmProblem, CadmmWarmStart, CadmmDiagnostics, InnerSolution
+
 
 
 # ==== tools ====
@@ -126,6 +132,26 @@ def _prox_task_block(c_task: np.ndarray, env_state, cadmm_params, aux) -> np.nda
 
 # === tools ====
 
+
+# TODO: 按照统一接口进行函数调用
+# def inner_cadmm_entry(
+#     env_state,             # 外部对象，只用于构造 problem snapshot
+#     link_state_current,
+#     cadmm_params: CadmmParams,
+#     flags: FeatureFlags,
+#     warm_start: CadmmWarmStart | None,
+#     step: int,
+#     rng,
+# ) -> tuple[InnerSolution, CadmmWarmStart, CadmmDiagnostics]:
+#     problem = build_problem_snapshot(...)
+#     return solve_inner_cadmm(problem, warm_start)
+
+
+# # Global cadmm entrance added by JiXX at 20260202
+# def solve_inner_cadmm(problem:CadmmProblem, warm_start: CadmmWarmStart | None = None) -> Tuple["InnerSolution", CadmmWarmStart, CadmmDiagnostics]:
+#     ...
+
+
 def inner_cadmm(
     env_state: EnvState,             
     rl_action: RLAction,
@@ -195,7 +221,8 @@ def _init_cadmm_state(env_state: EnvState, cadmm_params, rl_action=None, warm_st
     blocks = {}
     offset = 0
     dim_pos = 2 * num_robots
-    # 20251211新增, pos block
+    # 20251211新增, pos block, 
+    # 20260202修改为新的block定义形式
     blocks["pos"] = BlockSpec(
         name="pos", 
         start=offset, 
@@ -354,6 +381,15 @@ def _local_update_all(q, z, u, env_state, rl_action, link_state, cadmm_params, a
         )
     return new_q
 
+# TODO 按照更新后的dataclass更新函数
+# def update_z(
+#     problem: CadmmProblem,
+#     q: np.ndarray,    # (N,D)
+#     u: np.ndarray,    # (N,D)
+#     z_prev: np.ndarray # (D,)
+# ) -> tuple[np.ndarray, dict[str,float]]:  # z_new, violation_by_block
+
+
 def _global_update_z(q, z_old, u, env_state, cadmm_params, rl_action, aux) -> np.ndarray:
     """
     根据所有局部 q_i 更新全局变量 z。
@@ -429,6 +465,9 @@ def _global_update_z(q, z_old, u, env_state, cadmm_params, rl_action, aux) -> np
 
     return z_new
     
+# TODO 按照更新后的dataclass进行函数更新
+# def update_u(problem, q, z, u, eta) -> np.ndarray:
+# def compute_residuals(problem, q, z, z_prev) -> tuple[dict[str,float], dict[str,float]]:s
 def _dual_update_residual(q, z, z_new, u, cadmm_params, aux):
     """
     ADMM dual update and residual calculation
@@ -669,7 +708,14 @@ def _decode_robot_plan(q, env_state, rl_action, aux):
 
     return plan
 
-
+# TODO: 更新本地q值更新与新的dataclass对齐
+# def solve_local_q(
+#     rid: int,
+#     problem: CadmmProblem,
+#     z: np.ndarray,      # (D,)
+#     u_i: np.ndarray,    # (D,)
+#     q_i_prev: np.ndarray, # (D,) for warm local
+# ) -> np.ndarray:        # (D,) returns q_i
 def _solve_local(rid, q_i: LocalQ, z, u_i: LocalU, env_state, rl_action, link_state, cadmm_params, aux):
     """
     Local solver for each robot i

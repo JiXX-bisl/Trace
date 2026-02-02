@@ -48,6 +48,9 @@ class CadmmParams:
     ttl_hops: int            # 多跳 TTL (TTL_X)
     t_fresh: int             # 信息新鲜度窗口
     # 自适应 eta 参数 mu, tau_incr, tau_decr
+    mu: float
+    tau_incr: float
+    tau_decr: float
     # === cost ===
     move_w: float            # 移动代价权重
     
@@ -72,6 +75,8 @@ class CadmmParams:
     rep_w: float             # 势能权重
     rep_sigma: float         # 机器人节点距离势能
 
+# Old version
+# TODO: 删除并迁移外部代码到更新后的 CadmmWarmStart
 @dataclass
 class CadmmWarmStart:
     q_prev: Dict  # 每个机器人上一轮的局部变量
@@ -114,6 +119,8 @@ class RelayNode:
     value: Any
 
 # ===== cadmm block =====
+# old version
+# TODO: 删除并迁移外部代码到更新后的 BlockRegistry
 @dataclass
 class BlockSpec:
     name: str        # pos, cov, flow, qos, energy, task
@@ -121,6 +128,7 @@ class BlockSpec:
     end: int         # end index in global z
     shape: tuple     # original shape of this block
 
+# TODO: 删除并迁移外部代码到更新后的 LocalQ
 @dataclass
 class LocalQ:
     pos: np.ndarray
@@ -138,6 +146,7 @@ class LocalQ:
             # tasks=None if self.tasks is None else self.tasks.copy()
         )
 
+# TODO: 删除并迁移外部代码到更新后的 LocalU
 @dataclass
 class LocalU:
     pos: np.ndarray
@@ -154,3 +163,153 @@ class LocalU:
             # energy=None if self.energy is None else self.energy.copy(),
             # tasks=None if self.tasks is None else self.tasks.copy()
         )
+    
+# updated by JiXX at 20260202
+@dataclass
+class FeatureFlags:
+    # blocks
+    enable_pos: bool = True
+    enable_cov: bool = True
+    enable_f_hat: bool = True
+    enable_B_hat: bool = True
+    enable_y_hat: bool = True
+    enable_sigma: bool = True
+    enable_r_hat: bool = True
+
+    # projections per block
+    enable_proj_pos: bool = True
+    enable_proj_f_hat: bool = True
+    enable_proj_B_hat: bool = True
+    enable_proj_y_hat: bool = True
+    enable_proj_sigma: bool = True
+    enable_proj_r_hat: bool = True
+
+    # numeric
+    enable_over_relax: bool = True
+    enable_residual_balancing: bool = True
+    enable_async_updates: bool = False
+    enable_link_freeze: bool = True
+    enable_ttl_filter: bool = False
+
+    # diagnostics
+    log_block_residuals: bool = True
+    log_projection_violation: bool = True
+
+@dataclass(frozen=True)
+class BlockDef:
+    name: str
+    shape: tuple
+    dtype: str = "float32"
+
+# Constraints block for projections
+@dataclass
+class BoxC:
+    # box constraints
+    lo: np.ndarray
+    hi: np.ndarray
+
+@dataclass
+class SimplexC:
+    # 概率单纯形
+    sum_value: float
+
+@dataclass
+class WeightedSimplexC:
+    # 加权单纯形
+    w: np.ndarray
+    sum_value: float
+
+@dataclass
+class HalfspaceC:
+    # 线性半空间约束
+    a: np.ndarray
+    b: float
+
+@dataclass
+class AffineC:
+    # 仿射空间约束
+    A: np.ndarray
+    b: np.ndarray
+
+@dataclass
+class PolytopeC:
+    # 多面体集合约束
+    G: np.ndarray
+    h: np.ndarray
+    lo: np.ndarray | None
+    hi: np.ndarray | None
+
+
+# Inner problem snapshots
+@dataclass
+class LinkSnapshot:
+    robot_ids: list[int]
+    edges: np.ndarray      # (E, 2), int 32, each row (i, j) with i < j or directed, robot indices
+    signal: np.ndarray     # (E, )
+    # QoS metrics
+    capacity: np.ndarray   # (E, )
+    delay: np.ndarray      # (E, )
+    plr: np.ndarray        # (E, )
+    is_stale: np.ndarray   # (E, ), bool for ttl filter
+
+@dataclass
+class TaskSnapshot:
+    task_pos: np.ndarray       # (T, 2)  float/int grid coords
+    deadline: np.ndarray       # (T,)
+    priority: np.ndarray       # (T,)
+    cluster_id: np.ndarray     # (T,) int, in [0,G-1]
+
+@dataclass
+class CadmmProblem:
+    # static sizes
+    N: int                    # number of robots
+    E: int                    # links in snapshot
+    G: int                    # groups for y_hat
+    T: int                    # tasks
+
+    # inputs
+    robot_pos: np.ndarray               # (N, 2)
+    candidate_moves: list[np.ndarray]   # len N, each (Mi, 2)
+    coverage: float                     
+    frontier_entropy: np.ndarray        # (H, W)
+    repulsion_grad: np.ndarray          # (N, 2)
+
+    link: LinkSnapshot
+    task: TaskSnapshot
+
+    # reg: BlockRegistry
+    params: "CadmmParams"
+    flags: FeatureFlags
+    window: "CommWindowState"
+
+# Cadmm inner solution
+@dataclass
+class InnerSolution:
+    next_pos: np.ndarray        # (N,2) decoded from z_pos or q_pos
+    z: np.ndarray               # (D,)
+    q: np.ndarray               # (N,D)
+    u: np.ndarray               # (N,D)
+
+
+@dataclass
+class CommWindowState:
+    W: int
+    start_step: int
+    omega_seed: int
+    frozen_link: LinkSnapshot
+
+# Log and Warm-start
+@dataclass
+class CadmmWarmStart:
+    z: np.ndarray             # (D, )
+    u: np.ndarray             # (N, D)
+    q: np.ndarray             # (N, D)
+
+@dataclass
+class CadmmDiagnostics:
+    iters: int
+    r_norm: dict[str, float]       # block->r
+    s_norm: dict[str, float]       # block->s
+    eta_hist: list[float]
+    proj_violation: dict[str, float]
+
