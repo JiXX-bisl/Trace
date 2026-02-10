@@ -211,7 +211,8 @@ class BoxC:
 @dataclass
 class SimplexC:
     # 概率单纯形
-    sum_value: float
+    dim: int
+    sum_to: float
 
 @dataclass
 class WeightedSimplexC:
