@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import numpy as np
 
 
@@ -236,14 +236,14 @@ class PolytopeC:
     # 多面体集合约束
     G: np.ndarray
     h: np.ndarray
-    lo: np.ndarray | None
-    hi: np.ndarray | None
+    lo: Optional[np.ndarray] = None
+    hi: Optional[np.ndarray] = None
 
 
 # Inner problem snapshots
 @dataclass
 class LinkSnapshot:
-    robot_ids: list[int]
+    robot_ids: List[int]
     edges: np.ndarray      # (E, 2), int 32, each row (i, j) with i < j or directed, robot indices
     signal: np.ndarray     # (E, )
     # QoS metrics
@@ -269,7 +269,7 @@ class CadmmProblem:
 
     # inputs
     robot_pos: np.ndarray               # (N, 2)
-    candidate_moves: list[np.ndarray]   # len N, each (Mi, 2)
+    candidate_moves: List[np.ndarray]   # len N, each (Mi, 2)
     coverage: float                     
     frontier_entropy: np.ndarray        # (H, W)
     repulsion_grad: np.ndarray          # (N, 2)
@@ -308,8 +308,8 @@ class CadmmWarmStart:
 @dataclass
 class CadmmDiagnostics:
     iters: int
-    r_norm: dict[str, float]       # block->r
-    s_norm: dict[str, float]       # block->s
-    eta_hist: list[float]
-    proj_violation: dict[str, float]
+    r_norm: Dict[str, float]       # block->r
+    s_norm: Dict[str, float]       # block->s
+    eta_hist: List[float]
+    proj_violation: Dict[str, float]
 
