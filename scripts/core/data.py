@@ -191,6 +191,14 @@ class FeatureFlags:
     enable_link_freeze: bool = True
     enable_ttl_filter: bool = False
 
+    # q-step switches
+    enable_qstep_admm_term: bool = True
+    enable_qstep_admm_move: bool = False
+    enable_qstep_admm_explore: bool = False
+    enable_qstep_admm_task: bool = False
+    enable_qstep_admm_qos: bool = False 
+    enable_qstep_admm_repulsion: bool = False
+
     # diagnostics
     log_block_residuals: bool = True
     log_projection_violation: bool = True

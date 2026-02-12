@@ -24,6 +24,7 @@ All block access must go through BlockRegistry helpers.
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+from dataclasses import replace
 
 import numpy as np
 
@@ -52,6 +53,7 @@ from scripts.core.inner.projections import project_blocks
 from scripts.core.inner.window import open_or_update_window, select_window_link, apply_ttl_filter
 from scripts.core.inner.async_scheduler import get_active_set
 from scripts.core.inner.residual_balancing import residual_balance_step
+from scripts.core.inner.q_step import solve_local_q
 
 # =============================================================================
 # Public entry
@@ -125,6 +127,16 @@ def build_problem_snapshot(
                                      ttl_steps=int(getattr(params, "t_fresh", 0)), flags=flags)
 
     E_used = int(np.asarray(link_used.edges).shape[0])
+    flags_used = flags
+    if E_used == 0:
+        if getattr(flags, "enable_f_hat", False) or getattr(flags, "enable_B_hat", False):
+            flags_used = replace(
+                flags,
+                enable_f_hat=False,
+                enable_B_hat=False,
+                enable_proj_f_hat=False,
+                enable_proj_B_hat=False,
+            )
 
     # return frozen snapshot (E may change after ttl filter)
     return CadmmProblem(
@@ -140,7 +152,7 @@ def build_problem_snapshot(
         link=link_used,
         task=prob.task,
         params=params,
-        flags=flags,
+        flags=flags_used,
         window=window_new,
     )
 
@@ -302,39 +314,39 @@ def solve_inner_cadmm(
     return sol, ws, diag
 
 
-# =============================================================================
-# q-step
-# =============================================================================
+# # =============================================================================
+# # q-step
+# # =============================================================================
 
-def solve_local_q(
-    rid: int,
-    problem: CadmmProblem,
-    reg,
-    z: np.ndarray,
-    u_i: np.ndarray,
-    q_i_prev: np.ndarray,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """
-    Minimal q-step: only updates pos using discrete projection to (z - u_i).pos.
-    Other blocks copy z (keeps dimensions consistent, z-step handles constraints).
-    """
-    q_i = np.asarray(z, dtype=np.float32).copy()
+# def solve_local_q(
+#     rid: int,
+#     problem: CadmmProblem,
+#     reg,
+#     z: np.ndarray,
+#     u_i: np.ndarray,
+#     q_i_prev: np.ndarray,
+#     rng: np.random.Generator,
+# ) -> np.ndarray:
+#     """
+#     Minimal q-step: only updates pos using discrete projection to (z - u_i).pos.
+#     Other blocks copy z (keeps dimensions consistent, z-step handles constraints).
+#     """
+#     q_i = np.asarray(z, dtype=np.float32).copy()
 
-    if "pos" not in reg.names():
-        return q_i
+#     if "pos" not in reg.names():
+#         return q_i
 
-    pos_target_all = decode_pos(reg, z - u_i, problem.N)
-    target = pos_target_all[rid]
+#     pos_target_all = decode_pos(reg, z - u_i, problem.N)
+#     target = pos_target_all[rid]
 
-    candidates = np.asarray(problem.candidate_moves[rid], dtype=np.float32).reshape(-1, 2)
-    if candidates.shape[0] == 0:
-        return q_i
+#     candidates = np.asarray(problem.candidate_moves[rid], dtype=np.float32).reshape(-1, 2)
+#     if candidates.shape[0] == 0:
+#         return q_i
 
-    d2 = np.sum((candidates - target[None, :]) ** 2, axis=1)
-    best = candidates[int(np.argmin(d2))]
+#     d2 = np.sum((candidates - target[None, :]) ** 2, axis=1)
+#     best = candidates[int(np.argmin(d2))]
 
-    pos_all = decode_pos(reg, z, problem.N)
-    pos_all[rid] = best
-    set_block(reg, q_i, "pos", pos_all.reshape(-1))
-    return q_i
+#     pos_all = decode_pos(reg, z, problem.N)
+#     pos_all[rid] = best
+#     set_block(reg, q_i, "pos", pos_all.reshape(-1))
+#     return q_i

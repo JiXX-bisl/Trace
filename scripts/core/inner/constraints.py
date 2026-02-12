@@ -136,6 +136,21 @@ def build_constraints(
         else:
             # unknown blocks: no constraints by default
             out[name] = []
+    flags = problem.flags
+    proj_gate = {
+        "pos": "enable_proj_pos",
+        "f_hat": "enable_proj_f_hat",
+        "B_hat": "enable_proj_B_hat",
+        "y_hat": "enable_proj_y_hat",
+        "sigma": "enable_proj_sigma",
+        "r_hat": "enable_proj_r_hat",
+    }
+
+    for blk, attr in proj_gate.items():
+        if blk in out and hasattr(flags, attr) and (not getattr(flags, attr)):
+            out[blk] = []
+
+
     validate_constraints(out, reg)
     return out
 
