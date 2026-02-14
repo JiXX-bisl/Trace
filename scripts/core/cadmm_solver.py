@@ -48,7 +48,7 @@ from scripts.core.inner.blocks import (
     compute_eps_dual,
 )
 from scripts.core.inner.constraints import build_constraints
-from scripts.core.inner.projections import project_blocks
+from scripts.core.inner.projections import project_blocks, project_one_block
 
 from scripts.core.inner.window import open_or_update_window, select_window_link, apply_ttl_filter
 from scripts.core.inner.async_scheduler import get_active_set
@@ -257,6 +257,40 @@ def solve_inner_cadmm(
             z_tilde_blocks, constraints_by_block,
             method=proj_method, iters=proj_iters, tol=proj_tol
         )
+
+        # strict sigma coupling based on projected y_hat
+        if (
+            bool(getattr(problem.flags, "enable_sigma_coupled_to_y", True)) 
+            and ("sigma" in z_proj_blocks)
+            and ("y_hat" in z_proj_blocks)
+        ):
+            try:
+                cons2 = build_constraints(problem=problem, reg=reg, z_blocks=z_proj_blocks)
+                sigma_cons = cons2.get("sigma", [])
+                sigma_new, sigma_info2 = project_one_block(
+                    z_proj_blocks["sigma"],
+                    sigma_cons,
+                    method=proj_method,
+                    iters=proj_iters,
+                    tol=proj_tol
+                )
+                z_proj_blocks["sigma"] = sigma_new
+                d0 = diag_by_block.get(
+                    "sigma",
+                    {"iters_used": 0, "violations": [], "max_violation": 0.0, "delta_norm": 0.0}
+                )
+                d0 = dict(d0)
+                d0["coupled_pass"] = sigma_info2
+                d0["max_violation"] = float(
+                    max(
+                        float(d0.get("max_violation", 0.0) or 0.0),
+                        float(sigma_info2.get("max_violation", 0.0) or 0.0),
+                    )
+                )
+                diag_by_block["sigma"] = d0
+            except Exception:
+                pass
+
         z = reg.pack(z_proj_blocks)
 
         proj_violation = {

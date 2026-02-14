@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 
+import scripts.core.inner.coverage_metrics as coverage_metrics
 from scripts.core.inner.blocks import BlockRegistry
 from scripts.core.data import (
     CadmmProblem, 
@@ -79,6 +80,7 @@ def build_constraints(
     """
     z_blocks = {} if z_blocks is None else dict(z_blocks)
     out: Dict[str, List[object]] = {name: [] for name in reg.names()}
+    flags = getattr(problem, "flags", None)
 
     # common parameters
     cap: Optional[np.ndarray] = None
@@ -123,10 +125,20 @@ def build_constraints(
             cons.append(make_box(0.0, 1.0, dim))
             out[name] = cons
         elif name == "sigma":
-            # Stage 1 placeholder: simple box
-            # keep z_blocks hook for coupled sigma polytope depending on y_hat
-            _ = z_blocks.get("y_hat", None)
-            out[name] = [make_box(0.0, sigma_max, dim)]
+            if bool(getattr(flags, "enable_sigma_coupled_to_y", True)):
+                y_hat = z_blocks.get("y_hat", None)
+                if y_hat is None:
+                   out[name] = [make_box(0.0, sigma_max, dim)]
+                else:
+                    try:
+                        lo = coverage_metrics.sigma_lower_bound_from_y_hat(
+                            np.asarray(y_hat, dtype=np.float32).reshape(-1),
+                            getattr(problem, "params", None),
+                            flags
+                        )
+                        out[name] = [make_box(lo, sigma_max, dim)]
+                    except Exception:
+                        out[name] = [make_box(0.0, sigma_max, dim)]
         elif name == "r_hat":
             cons = [make_box(r_min, r_max, dim)]
             if R_total is not None:
@@ -136,7 +148,6 @@ def build_constraints(
         else:
             # unknown blocks: no constraints by default
             out[name] = []
-    flags = problem.flags
     proj_gate = {
         "pos": "enable_proj_pos",
         "f_hat": "enable_proj_f_hat",

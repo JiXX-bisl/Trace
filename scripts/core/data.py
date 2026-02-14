@@ -75,27 +75,6 @@ class CadmmParams:
     rep_w: float             # 势能权重
     rep_sigma: float         # 机器人节点距离势能
 
-# Old version
-# TODO: 删除并迁移外部代码到更新后的 CadmmWarmStart
-@dataclass
-class CadmmWarmStart:
-    q_prev: Dict  # 每个机器人上一轮的局部变量
-    z_prev: np.ndarray             # 全局变量
-    u_prev: Dict  # 对偶变量
-
-# Interface
-@dataclass
-class RobotPlan:
-    waypoints: List   # 规划窗口内的轨迹 [(x_t, y_t), ...]
-    role: str                          # "main" / "relay" / "free"
-    assigned_tasks: List          # 当前窗口负责的任务 ID
-
-@dataclass
-class InnerPlan:
-    robot_plans: Dict  # 每个机器人一份计划
-    dual_state: CadmmWarmStart         # 用于下一轮 warm-start
-    diagnostics: dict       # 残差曲线 / 目标值 / 迭代次数等
-
 
 @dataclass
 class LinkState:

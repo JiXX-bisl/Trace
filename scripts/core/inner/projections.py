@@ -546,6 +546,29 @@ def project_blocks(
         diag[name] = info
     return out, diag
 
+def project_one_block(
+    arr_1d_or_nd: np.ndarray,
+    cons_list: List[object],
+    *,
+    method: str = "dykstra",
+    iters: int = 50,
+    tol: float = 1e-6,
+    poly_method: str = "dykstra"
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Project a single block array to an intersection of constraints.
+
+    Helper to avoid duplicating flatten/project/reshape logic when some blocks
+    require a second projection pass (e.g., sigma coupled to projected y_hat).
+    """
+    a = np.asarray(arr_1d_or_nd)
+    shp = a.shape
+    v = a.reshape(-1).astype(np.float32, copy=False)
+    if cons_list is None or len(cons_list) == 0:
+        return a.copy(), {"iters_used": 0, "violations": [], "max_violation": 0.0, "delta_norm": 0.0}
+    x, info = project_to_constraints(v, cons_list, method=method, iters=iters, tol=tol, poly_method=poly_method)
+    return x.reshape(shp).astype(a.dtype, copy=False), info
+
 # ---------------------------------------------------------------------------
 # Field extractors 
 # ---------------------------------------------------------------------------
