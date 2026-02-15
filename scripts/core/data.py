@@ -269,7 +269,7 @@ class CadmmProblem:
     params: "CadmmParams"
     flags: FeatureFlags
     window: "CommWindowState"
-
+    
 # Cadmm inner solution
 @dataclass
 class InnerSolution:

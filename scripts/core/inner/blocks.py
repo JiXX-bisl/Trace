@@ -32,9 +32,8 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Import shared dataclasses from data.py (required by project structure)
 # ---------------------------------------------------------------------------
-from scripts.core.data import BlockDef, FeatureFlags  
-
-
+from scripts.core.data import BlockDef, FeatureFlags, CadmmProblem
+from scripts.core.inner.linear_assembler import build_linear_assembly
 
 # ---------------------------------------------------------------------------
 # Block Registry
@@ -337,6 +336,12 @@ class ConsensusResidual(ResidualModel):
         s_b = || eta * (z[sl_b] - z_prev[sl_b]) ||_2
     """
 
+    def __init__(self, problem: object, reg: BlockRegistry, flags: FeatureFlags):
+        self.problem = problem
+        self.reg = reg
+        self.flags = flags
+        # self.assembly = build_linear_assembly(problem, reg, flags)
+
     def primal_block_norms(self, q: np.ndarray, z: np.ndarray, reg: BlockRegistry) -> Tuple[Dict[str, float], float]:
         q = np.asarray(q)
         z = np.asarray(z)
@@ -381,37 +386,65 @@ class ConsensusResidual(ResidualModel):
 
 
 class LinearResidual(ResidualModel):
-    """Placeholder for future linear residual model (A/B migration).
+    """Linear residuals with optional coupled assembly and diagnostic/coupled groups."""
 
-    TODO: implement linear form using an assembler from `problem`.
-    """
-
-    def __init__(self, problem: object, reg: BlockRegistry, flags: FeatureFlags):
-        self.problem = problem
-        self.reg = reg
+    def __init__(self, problem: CadmmProblem, reg: BlockRegistry, flags: FeatureFlags):
+        self.assembly = build_linear_assembly(problem, reg, flags)
         self.flags = flags
 
     def primal_block_norms(self, q: np.ndarray, z: np.ndarray, reg: BlockRegistry) -> Tuple[Dict[str, float], float]:
-        raise NotImplementedError("LinearResidual is a TODO: implement when A/B linear residual form is ready.")
+        norms: Dict[str, float] = {}
+        ss = 0.0
+        include_diag = bool(getattr(self.flags, "include_diag_groups_in_stop", False))
+        include_coupled = bool(getattr(self.flags, "include_coupled_groups_in_stop", False))
+        reg_names = set(reg.names())
+        for name in self.assembly.names:
+            rv = self.assembly.apply_primal(name, q, z, reg)
+            n = float(np.linalg.norm(np.asarray(rv, dtype=np.float32).reshape(-1), ord=2))
+            norms[name] = n
+            if name in reg_names:
+                ss += n * n
+                continue
+            if name.startswith("diag_") and include_diag:
+                ss += n * n
+                continue
+            if name.startswith("coupled_") and include_coupled:
+                ss += n * n
+        total = float(np.sqrt(ss))
+        return norms, total
 
     def dual_block_norms(
         self, z: np.ndarray, z_prev: np.ndarray, eta: float, reg: BlockRegistry
     ) -> Tuple[Dict[str, float], float]:
-        raise NotImplementedError("LinearResidual is a TODO: implement when A/B linear residual form is ready.")
+        norms: Dict[str, float] = {}
+        ss = 0.0
+        include_diag = bool(getattr(self.flags, "include_diag_groups_in_stop", False))
+        include_coupled = bool(getattr(self.flags, "include_coupled_groups_in_stop", False))
+        reg_names = set(reg.names())
+        for name in self.assembly.names:
+            rv = self.assembly.apply_dual(name, z, z_prev, float(eta), reg)
+            n = float(np.linalg.norm(np.asarray(rv, dtype=np.float32).reshape(-1), ord=2))
+            norms[name] = n
+            if name in reg_names:
+                ss += n * n
+                continue
+            if name.startswith("diag_") and include_diag:
+                ss += n * n
+                continue
+            if name.startswith("coupled_") and include_coupled:
+                ss += n * n
+        total = float(np.sqrt(ss))
+        return norms, total
 
-
-def make_residual_model(problem: object, reg: BlockRegistry, flags: FeatureFlags) -> ResidualModel:
+def make_residual_model(problem: CadmmProblem, reg: BlockRegistry, flags: FeatureFlags) -> ResidualModel:
     """Residual model factory.
 
     Default: ConsensusResidual.
-    If ``flags.use_linear_residual`` is True, returns LinearResidual (TODO).
+    If ``flags.use_linear_residual`` is True, returns LinearResidual.
     """
-
-    use_linear = getattr(flags, "use_linear_residual", False)
-    if bool(use_linear):
+    if bool(getattr(flags, "use_linear_residual", False)):
         return LinearResidual(problem, reg, flags)
-    return ConsensusResidual()
-
+    return ConsensusResidual(problem, reg, flags)
 
 # ---------------------------------------------------------------------------
 # Stopping thresholds (epsilon) for ADMM

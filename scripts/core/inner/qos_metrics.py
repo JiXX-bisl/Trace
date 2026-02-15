@@ -285,3 +285,122 @@ def connectivity_score_from_positions(
         return 0.0
     return float(cost)
 
+def normalize_budget(
+    usage: np.ndarray,
+    window_state,
+    *,
+    mode: str = "per_edge_ref",
+    eps: float = 1e-8
+) -> np.ndarray:
+    """
+    Normalize budget/usage to a comparable scale.
+
+    - per_edge_ref: usage / ref_rate (edge-wise)
+    - global_ref: sum(usage) / ref_total (scalar broadcast)
+    """
+    u = np.asarray(usage, dtype=np.float32).reshape(-1)
+    ref = getattr(window_state, "ref_rate", None)
+    if ref is None:
+        try:
+            ref = np.asarray(getattr(getattr(window_state, "frozen_link", None), "capacity", None), dtype=np.float32)
+        except Exception:
+            ref = None
+    if ref is None:
+        ref = np.ones_like(u)
+    ref = np.asarray(ref, dtype=np.float32).reshape(-1)
+    if ref.size != u.size:
+        ref = np.ones_like(u)
+    if mode == "global_ref":
+        ref_total = getattr(window_state, "ref_total", None)
+        if ref_total is None:
+            ref_total = float(np.sum(ref))
+        denom = float(ref_total) if float(ref_total) > float(eps) else 1.0
+        ratio = float(np.sum(u)) / denom
+        return np.full_like(u, ratio, dtype=np.float32)
+    denom = np.maximum(ref, float(eps))
+    return (u / denom).astype(np.float32)
+
+def update_budget_cache(
+    *,
+    window_state,
+    reg,
+    value: np.ndarray,
+    ema: float,
+    enable_update: bool,
+    enable_soft_violation: bool,
+    tol: float,
+    flags = None,
+) -> None:
+    """Update window_state.budget_cache and optional soft violation.
+
+    This is intentionally soft: it never changes feasibility/projections.
+
+    Parameters
+    ----------
+    value:
+        If 1D: treated as z.
+        If 2D: treated as q (N,D), aggregated by mean.
+    """
+    _ = flags
+    if window_state is None:
+        return
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 1:
+            z_blocks = reg.unpack(arr)
+        elif arr.ndim == 2:
+            z_blocks = reg.unpack(np.mean(arr, axis=0))
+        else:
+            return
+
+        # Budget cache should track *byte budget usage* by default.
+        # Prefer B_hat (bytes), fallback to f_hat (flow) if B_hat is unavailable.
+        if "B_hat" in z_blocks:
+            usage = np.asarray(z_blocks["B_hat"], dtype=np.float32).reshape(-1)
+        elif "f_hat" in z_blocks:
+            usage = np.asarray(z_blocks["f_hat"], dtype=np.float32).reshape(-1)
+        else:
+            return
+    except Exception:
+        return
+
+    def _edge_key(i: int, j: int) -> tuple[int, int]:
+        return (i, j) if i <= j else (j, i)
+
+    edges = np.asarray(getattr(getattr(window_state, "frozen_link", None), "edges", np.zeros((0, 2), np.int32)), dtype=np.int32).reshape(-1, 2)
+    E = int(edges.shape[0])
+    if usage.size != E:
+        # Nothing to update.
+        return
+
+    cache_obj = getattr(window_state, "budget_cache", None)
+    if not isinstance(cache_obj, dict):
+        cache_obj = {}
+
+    a = float(ema)
+    a = min(max(a, 0.0), 1.0)
+    cache_vals = np.zeros((E,), dtype=np.float32)
+
+    for k, (i, j) in enumerate(edges):
+        key = _edge_key(int(i), int(j))
+        prev = float(cache_obj.get(key, 0.0))
+        cur = float(usage[k])
+        newv = cur if (not enable_update or a == 0.0) else (a * prev + (1.0 - a) * cur)
+        if enable_update:
+            cache_obj[key] = float(newv)
+        cache_vals[k] = float(cache_obj.get(key, prev if not enable_update else newv))
+
+    if enable_update:
+        setattr(window_state, "budget_cache", cache_obj)
+
+    if enable_soft_violation:
+        ref = getattr(window_state, "ref_rate", None)
+        if ref is None:
+            ref = np.asarray(getattr(getattr(window_state, "frozen_link", None), "capacity", np.ones((E,), np.float32)), dtype=np.float32).reshape(-1)
+        ref = np.asarray(ref, dtype=np.float32).reshape(-1)
+        if ref.size != E:
+            ref = np.ones((E,), dtype=np.float32)
+        viol = np.maximum(cache_vals - (ref - float(tol)), 0.0)
+        setattr(window_state, "budget_violation_vec", np.asarray(viol, dtype=np.float32))
+        setattr(window_state, "budget_violation", float(np.max(viol)) if viol.size > 0 else 0.0)
+

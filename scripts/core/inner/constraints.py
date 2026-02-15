@@ -107,6 +107,20 @@ def build_constraints(
             if cap is None:
                 raise ValueError("Missing capacity: problem.link.capacity is required when f_hat block exists")
             hi = _ensure_len(cap, dim, label="capacity for f_hat")
+            # Scheme-2 coupled feasibility: optionally enforce flow <= budget (edge-wise)
+            # by tightening f_hat's upper bound using current B_hat.
+            #
+            # NOTE: This is a *z-step* feasibility coupling. It is intentionally gated by
+            # a flag and defaults to OFF to preserve Stage D behavior.
+            if bool(getattr(flags, "enable_flow_coupled_to_budget", False)):
+                B_hat = z_blocks.get("B_hat", None)
+                if B_hat is not None:
+                    try:
+                        Bv = np.asarray(B_hat, dtype=np.float32).reshape(-1)
+                        Bv = _ensure_len(Bv, dim, label="B_hat for f_hat")
+                        hi = np.minimum(hi, np.maximum(Bv, 0.0))
+                    except Exception:
+                        pass
             out[name] = [make_box(0.0, hi, dim)]
         elif name == "B_hat":
             # Budget box: 0 <= B_hat <= capacity
@@ -230,31 +244,6 @@ def validate_constraints(constraints_by_block: Mapping[str, List[object]], reg: 
             raise ValueError(f"constraints list for '{name}' must not be None")
         for c in cons_list:
             _validate_one_constraint(c, dim, block=name)
-
-# ---------------------------------------------------------------------------
-# Placeholders for A/B migration and coupled constraints (stage-2)
-# ---------------------------------------------------------------------------
-
-
-def build_linear_residual_mats(problem: CadmmProblem, reg: BlockRegistry, flags: Any):
-    """Placeholder for A/B residual model migration.
-
-    Expected future output:
-        (A_list, B, c_list)
-
-    where each robot has a local A_i and c_i, and B is global.
-    """
-    raise NotImplementedError("TODO: build_linear_residual_mats will be implemented with an assembler layer.")
-
-
-def build_sigma_polytope(problem: CadmmProblem, y_hat: np.ndarray) -> PolytopeC:
-    """Placeholder for coupled sigma feasible set Pi_P(sigma; y_hat).
-
-    Stage-1 uses a Box placeholder; stage-2 should return a PolytopeC
-    parameterized by y_hat.
-    """
-    raise NotImplementedError("TODO: build_sigma_polytope will be implemented for coupled constraints.")
-
 
 # ---------------------------------------------------------------------------
 # Internal utilities

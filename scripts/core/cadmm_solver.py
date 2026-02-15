@@ -54,6 +54,9 @@ from scripts.core.inner.window import open_or_update_window, select_window_link,
 from scripts.core.inner.async_scheduler import get_active_set
 from scripts.core.inner.residual_balancing import residual_balance_step
 from scripts.core.inner.q_step import solve_local_q
+from scripts.core.inner.stage0_init import stage0_init_if_needed
+from scripts.core.inner.diagnostics import attach_stagec_diagnostics
+from scripts.core.inner import qos_metrics
 
 # =============================================================================
 # Public entry
@@ -118,13 +121,29 @@ def build_problem_snapshot(
     enable_ttl = bool(getattr(flags, "enable_ttl_filter", False))
 
     if enable_freeze:
-        W = int(getattr(window_state, "W", 1))
+        W = int(getattr(window_state, "W", getattr(flags, "window_steps", 1)))
         window_new = open_or_update_window(step, link_current, window_state, W, flags, rng)
         link_used = select_window_link(step, link_current, window_new, flags)
+        if bool(getattr(flags, "enable_stage0_init", True)):
+            stage0_init_if_needed(step, window_new, window_new.frozen_link, params, flags)
+    
+    if window_new is not None:
+        setattr(window_new, "staleness_strict", bool(getattr(params, "staleness_strict", False)))
 
     if enable_ttl:
-        link_used = apply_ttl_filter(link_used, ttl_hops=int(getattr(params, "ttl_hops", 0)),
-                                     ttl_steps=int(getattr(params, "t_fresh", 0)), flags=flags)
+        # link_used = apply_ttl_filter(link_used, ttl_hops=int(getattr(params, "ttl_hops", 0)),
+        #                              ttl_steps=int(getattr(params, "t_fresh", 0)), flags=flags)
+        ttl_steps_val = int(getattr(params, "ttl_steps", getattr(params, "t_fresh", 0)))
+        link_used = apply_ttl_filter(
+            link_current,
+            ttl_hops=int(getattr(params, "ttl_hops", 0)),
+            ttl_steps=ttl_steps_val,
+            flags=flags,
+            step=step,
+            window_state=window_new,
+            N=prob.N,
+            params=params
+        )
 
     E_used = int(np.asarray(link_used.edges).shape[0])
     flags_used = flags
@@ -186,6 +205,17 @@ def solve_inner_cadmm(
     proj_tol = float(getattr(problem.flags, "proj_tol", 1e-6))
     enable_over_relax = bool(getattr(problem.flags, "enable_over_relax", False))
 
+    # assembled ops
+    enable_assembled = bool(getattr(problem.flags, "enable_assembled_ops", False))
+    assembled_avg_active_only = bool(getattr(problem.flags, "assembled_avg_active_only", False))
+    assembled_u_update_active_only = bool(getattr(problem.flags, "assembled_u_update_active_only", False))
+    assembled_eps = float(getattr(problem.params, "assembled_eps", 1e-8))
+
+    # qos budget closed loop
+    enable_budget_cache_update = bool(getattr(problem.flags, "enable_budget_cache_update", False))
+    enable_budget_soft_violation = bool(getattr(problem.flags, "enable_budget_soft_violation", False))
+    budget_update_source = str(getattr(problem.flags, "budget_update_source", "z"))
+
     # async options
     enable_async = bool(getattr(problem.flags, "enable_async_updates", False))
     async_update_u_all = bool(getattr(problem.flags, "async_update_u_all", True))
@@ -227,7 +257,11 @@ def solve_inner_cadmm(
         u_prev = u.copy()
 
         # --- async mask ---
-        active_mask = get_active_set(k, N, problem.flags, rng) if enable_async else np.ones((N,), dtype=bool)
+        # active_mask = get_active_set(k, N, problem.flags, rng) if enable_async else np.ones((N,), dtype=bool)
+        hint = getattr(problem.window, "active_hint", None)
+        active_mask = (
+            get_active_set(k, N, problem.flags, rng, active_hint=hint) if enable_async else np.ones((N,), dtype=bool)
+        )
         if enable_async:
             async_active_hist.append(active_mask.copy())
 
@@ -247,9 +281,32 @@ def solve_inner_cadmm(
         # --- z-step ---
         if enable_over_relax:
             q_hat = alpha * q + (1.0 - alpha) * z_prev[None, :]
-            z_tilde = np.mean(q_hat + u, axis=0)
+            q_plus_u = q_hat + u
         else:
-            z_tilde = np.mean(q + u, axis=0)
+            q_hat = None
+            q_plus_u = q + u
+
+        if enable_assembled:
+            from scripts.core.inner.assembled_ops import owner_mask_for_block, assembled_average
+
+            delta = getattr(problem.window, "active_hint", None) if problem.window is not None else None
+            if assembled_avg_active_only and delta is not None:
+                active_avg = np.asarray(delta, dtype=bool).reshape(-1)
+                if active_avg.shape != (N,):
+                    active_avg = np.ones((N,), dtype=bool)
+            else:
+                active_avg = np.ones((N,), dtype=bool)
+
+            z_tilde = np.zeros((D,), dtype=np.float32)
+            for name in reg.names():
+                sl = reg.sl(name)
+                dim = int(reg.size(name)) if hasattr(reg, "size") else int(sl.stop - sl.start)
+                blk_vals = np.asarray(q_plus_u[:, sl], dtype=np.float32).reshape(N, dim)
+                own = owner_mask_for_block(name, problem, reg, problem.flags)
+                z_blk = assembled_average(name, blk_vals, own, active_avg, assembled_eps)
+                z_tilde[sl] = np.asarray(z_blk, dtype=np.float32).reshape(-1)
+        else:
+            z_tilde = np.mean(q_plus_u, axis=0)
 
         z_tilde_blocks = reg.unpack(z_tilde)
         constraints_by_block = build_constraints(problem, reg, z_blocks=z_tilde_blocks)
@@ -257,6 +314,21 @@ def solve_inner_cadmm(
             z_tilde_blocks, constraints_by_block,
             method=proj_method, iters=proj_iters, tol=proj_tol
         )
+
+        # Scheme-2 coupled feasibility passes (cross-block constraints affecting z)
+        from scripts.core.inner.coupled_projection_passes import apply_coupled_projection_passes
+
+        apply_coupled_projection_passes(
+            problem,
+            reg,
+            z_proj_blocks,
+            diag_by_block,
+            method=proj_method,
+            iters=proj_iters,
+            tol=proj_tol,
+        )
+
+        z = reg.pack(z_proj_blocks)
 
         # strict sigma coupling based on projected y_hat
         if (
@@ -299,12 +371,34 @@ def solve_inner_cadmm(
         }
 
         # --- u-step ---
+        if assembled_u_update_active_only:
+            delta_u = getattr(problem.window, "active_hint", None) if problem.window is not None else None
+            if delta_u is None:
+                u_mask = active_mask
+            else:
+                u_mask = np.asarray(delta_u, dtype=bool).reshape(-1)
+        else:
+            u_mask = active_mask
+        
         if async_update_u_all:
             u = u + (q - z[None, :])
         else:
             u = u_prev.copy()
-            u[active_mask] = u_prev[active_mask] + (q[active_mask] - z[None, :])
-
+            u[u_mask] = u_prev[u_mask] + (q[u_mask] - z[None, :])
+        
+        # --- QoS budget closed loop ---
+        if (problem.window is not None) and (enable_budget_cache_update or enable_budget_soft_violation):
+            src = z if budget_update_source == "z" else q
+            qos_metrics.update_budget_cache(
+                window_state=problem.window,
+                reg=reg,
+                value=src,
+                ema=float(getattr(problem.params, "budget_cache_ema", 0.0)),
+                enable_update=enable_budget_cache_update,
+                enable_soft_violation=enable_budget_soft_violation,
+                tol=float(getattr(problem.params, "budget_violation_tol", 0.0)),
+                flags=problem.flags,
+            )
         # --- residuals ---
         r_blk, r_global = res_model.primal_block_norms(q, z, reg)
         s_blk, s_global = res_model.dual_block_norms(z, z_prev, eta, reg)
@@ -337,6 +431,7 @@ def solve_inner_cadmm(
         eta_hist=eta_hist,
         proj_violation=proj_violation,
     )
+    attach_stagec_diagnostics(problem, reg, diag)
 
     # attach optional extra diagnostics (doesn't change dataclass definition)
     if enable_async:
@@ -347,40 +442,3 @@ def solve_inner_cadmm(
     # window info is better recorded at entry level (per env step), but we keep hook
     return sol, ws, diag
 
-
-# # =============================================================================
-# # q-step
-# # =============================================================================
-
-# def solve_local_q(
-#     rid: int,
-#     problem: CadmmProblem,
-#     reg,
-#     z: np.ndarray,
-#     u_i: np.ndarray,
-#     q_i_prev: np.ndarray,
-#     rng: np.random.Generator,
-# ) -> np.ndarray:
-#     """
-#     Minimal q-step: only updates pos using discrete projection to (z - u_i).pos.
-#     Other blocks copy z (keeps dimensions consistent, z-step handles constraints).
-#     """
-#     q_i = np.asarray(z, dtype=np.float32).copy()
-
-#     if "pos" not in reg.names():
-#         return q_i
-
-#     pos_target_all = decode_pos(reg, z - u_i, problem.N)
-#     target = pos_target_all[rid]
-
-#     candidates = np.asarray(problem.candidate_moves[rid], dtype=np.float32).reshape(-1, 2)
-#     if candidates.shape[0] == 0:
-#         return q_i
-
-#     d2 = np.sum((candidates - target[None, :]) ** 2, axis=1)
-#     best = candidates[int(np.argmin(d2))]
-
-#     pos_all = decode_pos(reg, z, problem.N)
-#     pos_all[rid] = best
-#     set_block(reg, q_i, "pos", pos_all.reshape(-1))
-#     return q_i

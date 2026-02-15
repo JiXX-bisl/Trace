@@ -23,6 +23,8 @@ def get_active_set(
     N: int,
     flags: FeatureFlags,
     rng: np.random.Generator,
+    *,
+    active_hint: np.ndarray | None = None
 ) -> np.ndarray:
     """
     Return active mask of shape (N,) bool.
@@ -40,6 +42,13 @@ def get_active_set(
     mode = str(getattr(flags, "async_mode", "all"))
     if mode == "all":
         return np.ones((N,), dtype=bool)
+    
+    if mode == "ttl_freshness":
+        if active_hint is not None:
+            hint = np.asarray(active_hint, dtype=bool).reshape(-1)
+            if hint.shape == (N,) and bool(np.any(hint)):
+                return hint.copy()
+        mode = "round_robin"
 
     m = _get_update_count(N, flags)
     mask = np.zeros((N,), dtype=bool)
