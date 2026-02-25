@@ -63,7 +63,7 @@ from scripts.core.inner import qos_metrics
 # =============================================================================
 
 def solve_inner_cadmm_entry(
-    env: Any,
+    env: CadmmProblem,  # 在外部代码中构建好后输入
     step: int,
     params: Any,
     flags: FeatureFlags,
@@ -106,7 +106,7 @@ def build_problem_snapshot(
     Both are optional; default keeps Step4 behavior.
     """
     if not isinstance(env_or_state, CadmmProblem):
-        raise TypeError("Step5: build_problem_snapshot expects a CadmmProblem or your own builder wrapper.")
+        raise TypeError("Build_problem_snapshot expects a CadmmProblem or your own builder wrapper.")
 
     prob = env_or_state
 
@@ -191,6 +191,7 @@ def solve_inner_cadmm(
     D = reg.total_dim
     N = problem.N
 
+    # === 在外部初始化的时候需要完成的设置 ===
     eta = float(getattr(problem.params, "eta", 1.0))
     alpha = float(getattr(problem.params, "alpha", 1.0))
     k_max = int(getattr(problem.params, "k_max", 30))
@@ -222,7 +223,8 @@ def solve_inner_cadmm(
 
     # residual balancing
     enable_rb = bool(getattr(problem.flags, "enable_residual_balancing", False))
-
+    # === 在外部初始化的时候需要完成的设置 ===
+    
     # init
     z = np.zeros((D,), dtype=np.float32)
     q = np.zeros((N, D), dtype=np.float32)

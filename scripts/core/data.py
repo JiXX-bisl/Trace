@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
 
 
@@ -40,14 +40,18 @@ class Task:
 
 @dataclass
 class CadmmParams:
-    eta: float               # 惩罚因子
-    alpha: float             # 过松弛系数
-    eps_pri: float           # 原始残差阈值
-    eps_dual: float          # 对偶残差阈值
+    eta: float               # 惩罚因子 影响q-step 二次项 u-step尺度和residual计算
+                             # C-ADMM验证实验可选用0.5/1.0/1.2 后续加入RL后作为可学习参数
+    alpha: float             # 过松弛系数 在FeatureFlags.enable_over_relax=True时生效
+                             # 设置为1.0为关闭，设置为1.5-1.8为加速
+    eps_pri: float           # 原始残差阈值  1e-3
+    eps_dual: float          # 对偶残差阈值  1e-3
     k_max: int               # 最大迭代轮数
+                             # 固定场景设置为50-200
     ttl_hops: int            # 多跳 TTL (TTL_X)
     t_fresh: int             # 信息新鲜度窗口
-    # 自适应 eta 参数 mu, tau_incr, tau_decr
+    # 自适应 eta 参数 mu, tau_incr, tau_decr 
+    # FeatureFlags.enable_residual_balancing=True 时使用
     mu: float
     tau_incr: float
     tau_decr: float
@@ -75,6 +79,21 @@ class CadmmParams:
     rep_w: float             # 势能权重
     rep_sigma: float         # 机器人节点距离势能
 
+    # new added by JiXX at 20260225
+    staleness_strict: bool = False  # stale判定开关
+    eps_rel: float = 0.0
+    assembled_eps: float = 1e-8
+    root_id_default: int = 0
+
+    # Stage0 / reachability / assembled / coupled residual
+    ref_rate_mode: str = "capacity"
+    ref_rate_ratio: float = 1.0
+    coupled_residual_scale: float = 1.0
+    diag_group_scale: float = 1.0
+
+    # QoS normalization
+    budget_cache_ema: float = 1.0
+
 
 @dataclass
 class LinkState:
@@ -98,55 +117,11 @@ class RelayNode:
     value: Any
 
 # ===== cadmm block =====
-# old version
-# TODO: 删除并迁移外部代码到更新后的 BlockRegistry
-@dataclass
-class BlockSpec:
-    name: str        # pos, cov, flow, qos, energy, task
-    start: int       # start index in global z
-    end: int         # end index in global z
-    shape: tuple     # original shape of this block
-
-# TODO: 删除并迁移外部代码到更新后的 LocalQ
-@dataclass
-class LocalQ:
-    pos: np.ndarray
-    flow=None
-    qos=None
-    energy=None
-    tasks=None
-
-    def copy(self) -> "LocalQ":
-        return LocalQ(
-            pos=self.pos.copy(),
-            # flow=None if self.flow is None else self.flow.copy(),
-            # qos=None if self.qos is None else self.qos.copy(),
-            # energy=None if self.energy is None else self.energy.copy(),
-            # tasks=None if self.tasks is None else self.tasks.copy()
-        )
-
-# TODO: 删除并迁移外部代码到更新后的 LocalU
-@dataclass
-class LocalU:
-    pos: np.ndarray
-    flow=None
-    qos=None
-    energy=None
-    tasks=None
-
-    def copy(self) -> "LocalU":
-        return LocalU(
-            pos=self.pos.copy(),
-            # flow=None if self.flow is None else self.flow.copy(),
-            # qos=None if self.qos is None else self.qos.copy(),
-            # energy=None if self.energy is None else self.energy.copy(),
-            # tasks=None if self.tasks is None else self.tasks.copy()
-        )
-    
 # updated by JiXX at 20260202
 @dataclass
 class FeatureFlags:
     # blocks
+    # 决定在make_registry中是否包含指定的block 从而改变整体维度
     enable_pos: bool = True
     enable_cov: bool = True
     enable_f_hat: bool = True
@@ -156,6 +131,7 @@ class FeatureFlags:
     enable_r_hat: bool = True
 
     # projections per block
+    # 若 False 该 block 在 z-step 不投影
     enable_proj_pos: bool = True
     enable_proj_f_hat: bool = True
     enable_proj_B_hat: bool = True
@@ -164,11 +140,12 @@ class FeatureFlags:
     enable_proj_r_hat: bool = True
 
     # numeric
-    enable_over_relax: bool = True
-    enable_residual_balancing: bool = True
-    enable_async_updates: bool = False
-    enable_link_freeze: bool = True
-    enable_ttl_filter: bool = False
+    enable_over_relax: bool = True          # 启用over-relax z-step输入
+    enable_residual_balancing: bool = True  # 启用eta自适应
+    enable_async_updates: bool = False      # 启用异步mask
+    enable_link_freeze: bool = True         # 启用window freeze
+    enable_ttl_filter: bool = False         # 启用stale边删除
+    enable_staleness_engine: bool = True    # 启用last_seen/is_stale/active_hint 的内部维护
 
     # q-step switches
     enable_qstep_admm_term: bool = True
@@ -178,9 +155,75 @@ class FeatureFlags:
     enable_qstep_admm_qos: bool = False 
     enable_qstep_admm_repulsion: bool = False
 
+    # q-step block-wise update
+    enable_qstep_cost_move: bool = False        # 移动代价权重开关
+    enable_qstep_cost_explore: bool = False     # 探索得分权重开关
+    enable_qstep_cost_task: bool = False        # 任务紧急程度权重开关
+    enable_qstep_cost_repulsion: bool = False   # 排斥代价权重开关
+    enable_qstep_cost_qos_pos: bool = False
+    enable_qstep_update_y_hat: bool = False
+    enable_qstep_update_B_hat: bool = False
+    enable_qstep_update_f_hat: bool = False
+    enable_qstep_update_r_hat: bool = False
+    enable_qstep_update_sigma: bool = False
+    enable_rhat_include_coverage: bool = False
+    # q-step 会按这些 flags 决定是否把 y_hat/sigma/B_hat/f_hat/r_hat 写回 q_i_new
+
+    # residual 
+    linear_assembly_mode: str = "consensus_equiv" # | "assembled_ops"
+    use_linear_residual: bool = False             # 是否启用 LinearResidual
+    use_coupled_linear_assembly: bool = False     # assembled_ops 残差是否乘 owner mask
+    log_linear_groups: bool = False               # 是否附加 diag_* groups
+    include_diag_groups_in_stop: bool = False     # diag 是否计入 total norm（影响 stop 与 eta balancing）
+    enable_coupled_groups: bool = False           # 是否启用 StageE 的 coupled_* groups（sigma_y、flow_budget）
+    include_coupled_groups_in_stop: bool = False  # coupled_* 是否计入 total norm 语义 stop对比的核心开关
+
     # diagnostics
     log_block_residuals: bool = True
     log_projection_violation: bool = True
+
+    # new added by JiXX at 20260225
+    reachability_root_id: int = 0  # 外部赋值 代表目标机器人id
+
+    enable_stage0_init: bool = True
+    enable_assembled_ops: bool = False          # z-step 使用 owner-mask assembled average
+    # owner mask 与 delta 参与范围
+    assembled_owner_mode: str = "all"  # | "pos_only" | "edge_by_src" | "edge_by_incident" | "root_only"
+    assembled_avg_active_only: bool = False
+    assembled_u_update_active_only: bool = False
+
+    # 预算闭环统计
+    budget_update_source: str = "z"
+    enable_budget_cache_update: bool = False
+    enable_budget_soft_violation: bool = False
+
+    # 只影响 attach_stagec_diagnostics 里是否记录归一化预算摘要，不改变求解本体
+    enable_budget_normalization: bool = False
+
+    enable_qos_aware_edges: bool = True
+
+    enable_flow_coupled_to_budget: bool = False  # 是否在 constraints 里收紧 f_hat 上界
+    enable_sigma_coupled_to_y: bool = True       # sigma 的下界由 y_hat 诱导的开关
+
+    async_update_u_all: bool = True
+
+    proj_method: str = "dykstra"
+    proj_iters: int = 80
+    proj_tol: float = 1e-6
+
+    active_hint_mode: str = "incident"  # | "reachability" | "reachability_with_memory"
+
+    # reach mode
+    reachability_root_mode: str = "base0"  # | "given" | "highest_degree"
+    reachability_requires_fresh: bool = True
+    reachability_fallback_to_incident: bool = True
+
+    # async mode
+    async_mode: str = "all"  # | "ttl_freshness" | "round_robin" | "random_k"
+    async_k: int = 0  # 1
+    async_ratio: float = 1.0
+    
+    coupled_primal_source: str = "z"  # | "q_mean"
 
 @dataclass(frozen=True)
 class BlockDef:
@@ -285,6 +328,12 @@ class CommWindowState:
     start_step: int
     omega_seed: int
     frozen_link: LinkSnapshot
+    budget_cache: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    # Outer set
+    # stage0_inited_step/ref_rate/ref_total/ref_rate_summary (stage0_init)
+    # last_seen_step/is_stale/active_hint (staleness/window.apply_ttl_filter)
+    # parent/dist_to_root/last_success_hops/last_success_step (reachability_with_memory)
+    # budget_violation/budget_violation_vec (qos_metrics.update_budget_cache)
 
 # Log and Warm-start
 @dataclass

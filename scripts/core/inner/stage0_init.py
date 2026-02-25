@@ -34,8 +34,8 @@ def stage0_init_if_needed(
     if int(getattr(window_state, "stage0_inited_step", -1)) == int(step):
         return
 
-    mode = str(getattr(params, "stage0_ref_rate_mode", "capacity"))
-    ratio = float(getattr(params, "stage0_budget_ratio", 1.0))
+    mode = str(getattr(params, "ref_rate_mode", "capacity"))
+    ratio = float(getattr(params, "ref_rate_ratio", 1.0))
     ratio = max(ratio, 0.0)
 
     cap = np.asarray(getattr(link_frozen, "capacity", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1)
@@ -43,6 +43,7 @@ def stage0_init_if_needed(
         ref = cap
     else:
         # fallback: still use capacity
+        # TODO: ref_rate can be replaced by Lee model / running statistics.
         ref = cap
     ref_rate = (ref * ratio).astype(np.float32, copy=False)
     setattr(window_state, "ref_rate", ref_rate)
@@ -51,10 +52,10 @@ def stage0_init_if_needed(
     budget_cache: Dict[Tuple[int, int], float] = {}
     for (i, j) in edges:
         budget_cache[_edge_key(int(i), int(j))] = 0.0
-    setattr(window_state, "budget_cache", budget_cache)
-
+    # setattr(window_state, "budget_cache", budget_cache)
+    window_state.budget_cache = budget_cache
     setattr(window_state, "stage0_inited_step", int(step))
-    # TODO: ref_rate can be replaced by Lee model / running statistics.
+    
     # extra summaries
     try:
         setattr(window_state, "ref_total", float(np.sum(ref_rate)))

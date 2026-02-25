@@ -48,7 +48,7 @@ def coverage_group_scores(problem: object, rid: int, pos_xy: np.ndarray) -> np.n
     if G <= 0:
         return np.zeros((0,), dtype=np.float32)
     
-    params = getattr(problem, "prams", None)
+    params = getattr(problem, "params", None)
     ent = np.asarray(getattr(problem, "frontier_entropy", np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
     
     try:

@@ -391,7 +391,7 @@ def update_budget_cache(
         cache_vals[k] = float(cache_obj.get(key, prev if not enable_update else newv))
 
     if enable_update:
-        setattr(window_state, "budget_cache", cache_obj)
+        window_state.budget_cache = cache_obj
 
     if enable_soft_violation:
         ref = getattr(window_state, "ref_rate", None)
