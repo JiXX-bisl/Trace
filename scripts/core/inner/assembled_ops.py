@@ -71,10 +71,12 @@ def owner_mask_for_block(block_name: str, problem: Any, reg: Any, flags: Any) ->
         if block_name != "pos":
             return m
         # pos is (N,2) flattened -> each robot owns its own 2 coords
+        # we added coord flag
+        coord_dim = problem.coord_dim
         m[:] = False
         for i in range(N):
-            a = 2 * i
-            b = a + 2
+            a = coord_dim * i
+            b = a + coord_dim
             if b <= dim:
                 m[i, a:b] = True
         return m

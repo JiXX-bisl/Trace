@@ -20,8 +20,8 @@ older snapshots/tests that may not provide the new fields.
 
 from __future__ import annotations
 
-from typing import Optional
-
+import sys
+from typing import Optional, Dict, Tuple
 import numpy as np
 
 from scripts.core.data import CadmmProblem
@@ -32,6 +32,64 @@ import scripts.core.inner.qos_metrics as qos_metrics
 # ---------------------------------------------------------------------------
 # Cost terms (Stage A)
 # ---------------------------------------------------------------------------
+
+# ---- cached offsets for speed ----
+_GAIN_GRID_CACHE: Dict[Tuple[int, int, int, int, float], np.ndarray] = {}  # key -> gain_grid
+
+_OFFSETS_CACHE_3D: Dict[int, np.ndarray] = {}
+
+def _ball_offsets(rv: int) -> np.ndarray:
+    rv = int(rv)
+    if rv in _OFFSETS_CACHE_3D:
+        return _OFFSETS_CACHE_3D[rv]
+    pts = []
+    r2 = rv * rv
+    for dz in range(-rv, rv + 1):
+        for dy in range(-rv, rv + 1):
+            for dx in range(-rv, rv + 1):
+                if dx*dx + dy*dy + dz*dz <= r2:
+                    pts.append((dz, dy, dx))
+    arr = np.asarray(pts, dtype=np.int32)
+    _OFFSETS_CACHE_3D[rv] = arr
+    return arr
+
+def _compute_gain_grid_zyx(ent_zyx: np.ndarray, *, sense_radius: float = 5.0, resolution: float = 1.0) -> np.ndarray:
+    """
+    ent_zyx: (D,H,W) float32 in [0,1]
+    return gain_grid_zyx: (D,H,W) mean entropy in sensing ball
+    """
+    ent = np.asarray(ent_zyx, dtype=np.float32)
+    assert ent.ndim == 3
+    D, H, W = ent.shape
+    rv = int(np.ceil(float(sense_radius) / float(resolution)))
+    offs = _ball_offsets(rv)
+
+    # pad to avoid bounds checks inside loop
+    pad = rv
+    ent_pad = np.pad(ent, ((pad,pad),(pad,pad),(pad,pad)), mode="constant", constant_values=0.0)
+    acc = np.zeros((D, H, W), dtype=np.float32)
+
+    # each offset is a pure slice add (fast)
+    for dz, dy, dx in offs:
+        z0 = pad + dz
+        y0 = pad + dy
+        x0 = pad + dx
+        acc += ent_pad[z0:z0+D, y0:y0+H, x0:x0+W]
+
+    gain = acc / float(len(offs))
+    return gain.astype(np.float32, copy=False)
+
+def get_gain_grid(ent_zyx: np.ndarray, *, sense_radius: float = 5.0, resolution: float = 1.0) -> np.ndarray:
+    # cache by (data_ptr, D,H,W, sense_radius, resolution)
+    ent = np.asarray(ent_zyx, dtype=np.float32)
+    D, H, W = int(ent.shape[0]), int(ent.shape[1]), int(ent.shape[2])
+    ptr = int(ent.__array_interface__["data"][0])
+    key = (ptr, D, H, W, float(sense_radius), float(resolution))
+    gg = _GAIN_GRID_CACHE.get(key, None)
+    if gg is None or gg.shape != ent.shape:
+        gg = _compute_gain_grid_zyx(ent, sense_radius=sense_radius, resolution=resolution)
+        _GAIN_GRID_CACHE[key] = gg
+    return gg
 
 
 def cost_admm_quadratic(cand: np.ndarray, target: np.ndarray, eta: float) -> float:
@@ -46,31 +104,66 @@ def cost_move(cand: np.ndarray, current_pos: np.ndarray, move_w: float) -> float
     return float(move_w) * float(np.dot(d, d))
 
 
+# def cost_explore_from_frontier_entropy(
+#     cand: np.ndarray,
+#     frontier_entropy: np.ndarray,
+#     new_w: float,
+# ) -> float:
+#     """- new_w * entropy_at(cand) with safe bounds handling.
+
+#     Coordinate convention:
+#       - cand = (x, y) or (x, y, z)
+#       - frontier_entropy indexed as [z, y, x]
+
+#     Out-of-bounds -> entropy = 0.
+#     """
+#     ent = np.asarray(frontier_entropy)
+#     if ent.ndim == 3:
+#         D, H, W = int(ent.shape[0]), int(ent.shape[1]), int(ent.shape[2])
+#         x = int(np.round(float(cand[0])))
+#         y = int(np.round(float(cand[1])))
+#         z = int(np.round(float(cand[2])))
+#         if (x < 0) or (x >= W) or (y < 0) or (y >= H) or (z < 0) or (z >= D):
+#             e = 0.0
+#         else:
+#             e = float(ent[z, y, x])
+#         return -float(new_w) * e
+#     elif ent.ndim == 2:
+#         H, W = int(ent.shape[0]), int(ent.shape[1])
+#         x = int(np.round(float(cand[0])))
+#         y = int(np.round(float(cand[1])))
+#         if (x < 0) or (x >= W) or (y < 0) or (y >= H):
+#             e = 0.0
+#         else:
+#             e = float(ent[y, x])
+#         return -float(new_w) * e
+#     else:
+#         return 0.0
 def cost_explore_from_frontier_entropy(
     cand: np.ndarray,
     frontier_entropy: np.ndarray,
     new_w: float,
+    *,
+    sense_radius: float = 5.0,
+    resolution: float = 1.0,
 ) -> float:
-    """- new_w * entropy_at(cand) with safe bounds handling.
-
-    Coordinate convention:
-      - cand = (x, y)
-      - frontier_entropy indexed as [row=y, col=x]
-
-    Out-of-bounds -> entropy = 0.
-    """
-    ent = np.asarray(frontier_entropy)
-    if ent.ndim != 2:
+    ent = np.asarray(frontier_entropy, dtype=np.float32)
+    if ent.ndim != 3:
         return 0.0
-    H, W = int(ent.shape[0]), int(ent.shape[1])
-    x = int(np.round(float(cand[0])))
-    y = int(np.round(float(cand[1])))
-    if (x < 0) or (x >= W) or (y < 0) or (y >= H):
-        e = 0.0
-    else:
-        e = float(ent[y, x])
-    return -float(new_w) * e
 
+    gain_grid = get_gain_grid(ent, sense_radius=sense_radius, resolution=resolution)
+
+    D, H, W = int(ent.shape[0]), int(ent.shape[1]), int(ent.shape[2])
+    x = float(cand[0]); y = float(cand[1]); z = float(cand[2] if cand.size >= 3 else 0.0)
+
+    ix = int(np.clip(np.floor(x / resolution), 0, W - 1))
+    iy = int(np.clip(np.floor(y / resolution), 0, H - 1))
+    iz = int(np.clip(np.floor(z / resolution), 0, D - 1))
+
+    g = float(gain_grid[iz, iy, ix])
+    if not np.isfinite(g):
+        g = 0.0
+    return -float(new_w) * g
 
 def cost_task_distance(
     cand: np.ndarray,
@@ -78,13 +171,14 @@ def cost_task_distance(
     priority: np.ndarray,
     deadline: np.ndarray,
     urgency_w: float,
+    coord_dim: int
 ) -> float:
     """urgency_w * min_j (urgency_j * ||cand - task_pos_j||).
 
     urgency_j = priority_j / max(deadline_j, 1.0)
     If no tasks -> 0.
     """
-    tp = np.asarray(task_pos, dtype=np.float32).reshape(-1, 2)
+    tp = np.asarray(task_pos, dtype=np.float32).reshape(-1, coord_dim)
     if tp.shape[0] == 0:
         return 0.0
     pr = np.asarray(priority, dtype=np.float32).reshape(-1)
@@ -108,9 +202,10 @@ def cost_repulsion(
     current_pos: np.ndarray,
     repulsion_grad_i: np.ndarray,
     rep_w: float,
+    coord_dim: int
 ) -> float:
     """rep_w * dot(repulsion_grad[rid], cand-current_pos)."""
-    grad = np.asarray(repulsion_grad_i, dtype=np.float32).reshape(2)
+    grad = np.asarray(repulsion_grad_i, dtype=np.float32).reshape(coord_dim)
     delta = cand - current_pos
     return float(rep_w) * float(np.dot(grad, delta))
 
@@ -125,7 +220,6 @@ def pos_candidate_score(
     eta: float,
 ) -> float:
     """Composable total cost for selecting a position candidate (Stage A)."""
-
     flags = getattr(problem, "flags", None)
     params = getattr(problem, "params", None)
 
@@ -133,16 +227,20 @@ def pos_candidate_score(
 
     # ADMM quadratic term (default ON)
     if bool(getattr(flags, "enable_qstep_admm_term", True)):
+        # print(f"ADMM cost: {cost_admm_quadratic(cand, target, eta)}")
         total += cost_admm_quadratic(cand, target, eta)
 
     # move
     if bool(getattr(flags, "enable_qstep_cost_move", False)):
         move_w = float(getattr(params, "move_w", 0.0))
-        total += cost_move(cand, current_pos, move_w)
+        move_cost = cost_move(cand, current_pos, move_w)
+        # print(f"Move cost: {move_cost}")
+        total += move_cost
 
     # explore
     if bool(getattr(flags, "enable_qstep_cost_explore", False)):
         new_w = float(getattr(params, "new_w", 0.0))
+        # print(f"Explore cost: {cost_explore_from_frontier_entropy(cand, problem.frontier_entropy, new_w)}")
         total += cost_explore_from_frontier_entropy(cand, problem.frontier_entropy, new_w)
 
     # task
@@ -150,37 +248,43 @@ def pos_candidate_score(
         urgency_w = float(getattr(params, "urgency_w", 0.0))
         task = getattr(problem, "task", None)
         if task is not None:
-            total += cost_task_distance(
+            task_cost = cost_task_distance(
                 cand,
-                getattr(task, "task_pos", np.zeros((0, 2), dtype=np.float32)),
+                getattr(task, "task_pos", np.zeros((0, problem.coord_dim), dtype=np.float32)),
                 getattr(task, "priority", np.zeros((0,), dtype=np.float32)),
                 getattr(task, "deadline", np.zeros((0,), dtype=np.float32)),
                 urgency_w,
+                problem.coord_dim
             )
+            # print(f"Task cost: {task_cost}")
+            total += task_cost
+            # sys.exit()
 
     # repulsion
     if bool(getattr(flags, "enable_qstep_cost_repulsion", False)):
         rep_w = float(getattr(params, "rep_w", 0.0))
         rep_grad = np.asarray(
-            getattr(problem, "repulsion_grad", np.zeros((problem.N, 2), dtype=np.float32)),
+            getattr(problem, "repulsion_grad", np.zeros((problem.N, problem.coord_dim), dtype=np.float32)),
             dtype=np.float32,
         )
-        if rep_grad.ndim == 2 and rep_grad.shape[0] > rid:
-            total += cost_repulsion(cand, current_pos, rep_grad[rid], rep_w)
+        if rep_grad.ndim == 2 and rep_grad.shape[0] > rid and rep_grad.shape[1] >= problem.coord_dim:
+            # print(f"Repulsion cost: {cost_repulsion(cand, current_pos, rep_grad[rid], rep_w, problem.coord_dim)}")
+            total += cost_repulsion(cand, current_pos, rep_grad[rid], rep_w, problem.coord_dim)
     
     # qos connectivity
     if bool(getattr(flags, "enable_qstep_cost_qos_pos", False)):
         try: 
-            total += float(
+            qos_cost = float(
                 qos_metrics.connectivity_score_from_positions(
                     cand,
-                    getattr(problem, "robot_pos", np.zeros((0,2), dtype=np.float32)),
-                    params
+                    getattr(problem, "robot_pos", np.zeros((0,problem.coord_dim), dtype=np.float32)),
+                    params, problem.coord_dim
                 )
             )
+            # print(f"QoS cost: {qos_cost}")
+            total += qos_cost
         except Exception:
             pass
-
     return float(total)
 
 
@@ -225,21 +329,36 @@ def solve_local_q(
     _ = q_i_prev  # reserved for Stage B extensions
     _ = rng
 
-    # Baseline: copy z (keeps other blocks consistent with current pipeline)
-    q_i_new = np.asarray(z, dtype=np.float32).copy()
-    flags = getattr(problem, "flags", None)
-    params = getattr(problem, "params", None)
+    # # Baseline: copy z (keeps other blocks consistent with current pipeline)
+    # q_i_new = np.asarray(z, dtype=np.float32).copy()
+    # flags = getattr(problem, "flags", None)
 
+    # new added at 20260227 by JiXX
+    flags = getattr(problem, "flags", None)
+    # Strict ADMM mode: q-step is proximal for f_i(q) = 0 in scaled form
+    # q_i := argmin (eta / 2) || q - z + u_i || ^ 2 => q_i = z - u_i
+    strict_prox = bool(getattr(flags, "qstep_strict_prox", False))
+    if strict_prox:
+        q_i_new = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32)).copy()
+        return q_i_new
+    
+    # Default (heuristic) mode: copy z then optionally update blocks
+    q_i_new = np.asarray(z, dtype=np.float32).copy()
+
+    params = getattr(problem, "params", None)
+    coord_dim = problem.coord_dim
     # Default best position for downstream updates
-    current_pos = np.asarray(problem.robot_pos[rid], dtype=np.float32).reshape(2)
+    current_pos = np.asarray(problem.robot_pos[rid], dtype=np.float32).reshape(coord_dim)
     best = current_pos
 
     # --- Pos Update ---
-    if "pos" in reg.names():
+    # gate for future: disable pos update without removing pos block
+    enable_pos_update = bool(getattr(flags, "enable_qstep_update_pos", True))
+    if enable_pos_update and ("pos" in reg.names()):
         try:
             candidates = np.asarray(problem.candidate_moves[rid], dtype=np.float32)
         except Exception:
-            candidates = np.zeros((0,2), dtype=np.float32)
+            candidates = np.zeros((0,coord_dim), dtype=np.float32)
         
         if candidates.shape[0] > 0:
             N = int(getattr(problem, "N", 0)) or int(problem.N)
@@ -247,13 +366,11 @@ def solve_local_q(
                 target_all = decode_pos(
                     reg, 
                     np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32),
-                    N
+                    N, problem.coord_dim
                 )
             except Exception:
-                target_all = decode_pos(reg, np.asarray(z, dtype=np.float32), N)
-
-            target = np.asarray(target_all[rid], dtype=np.float32).reshape(2)
-
+                target_all = decode_pos(reg, np.asarray(z, dtype=np.float32), N, problem.coord_dim)
+            target = np.asarray(target_all[rid], dtype=np.float32).reshape(coord_dim)
             eta = float(getattr(params, "eta", 1.0)) if params is not None else 1.0
 
             best_idx: int = 0
@@ -275,33 +392,78 @@ def solve_local_q(
                     if (c < best_cost) or (c == best_cost and idx < best_idx):
                         best_cost = c
                         best_idx = idx
-            best = np.asarray(candidates[best_idx], dtype=np.float32).reshape(2)
-            pos_all = np.asarray(decode_pos(reg, np.asarray(z, dtype=np.float32), N), dtype=np.float32)
+            best = np.asarray(candidates[best_idx], dtype=np.float32).reshape(coord_dim)
+            pos_all = np.asarray(decode_pos(reg, np.asarray(z, dtype=np.float32), N, problem.coord_dim), dtype=np.float32)
             pos_all = pos_all.copy()
-            if pos_all.ndim == 2 and pos_all.shape[0] > rid:
+            # if pos_all.ndim == coord_dim and pos_all.shape[0] > rid:
+            if pos_all.ndim == 2 and pos_all.shape[0] > rid and pos_all.shape[1] == coord_dim:
                 pos_all[rid] = best
                 set_block(reg, q_i_new, "pos", pos_all.reshape(-1))
     
     # --- Other blocks ---
     # 1) y_hat: coverage preference
     y_hat_pref: Optional[np.ndarray] = None
+    y_hat_final: Optional[np.ndarray] = None
     if ("y_hat" in reg.names()) and bool(getattr(flags, "enable_qstep_update_y_hat", True)):
         try:
             raw_scores = coverage_metrics.coverage_group_scores(problem, rid, best)
             y_hat_pref = coverage_metrics.normalize_to_simplex_nonneg(raw_scores)
-            set_block(reg, q_i_new, "y_hat", np.asarray(y_hat_pref, dtype=np.float32))
+
+            damp = bool(getattr(flags, "enable_qstep_damped_y_hat", False))
+
+            if damp:
+                # anchor on ADMM target (z - ui)
+                z_minus_u = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32))
+                y_tgt = np.asarray(get_block(reg, z_minus_u, "y_hat"), dtype=np.float32).reshape(-1)
+                beta = float(getattr(params, "y_hat_beta", 1.0))
+                if not np.isfinite(beta):
+                    beta = 1.0
+                beta = float(np.clip(beta, 0.0, 1.0))
+                y_mix = (1.0 - beta) * y_tgt + beta * y_hat_pref
+                y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_mix)
+            else:
+                y_hat_final = np.asarray(y_hat_pref, dtype=np.float32).reshape(-1)
+            set_block(reg, q_i_new, "y_hat", np.asarray(y_hat_final, dtype=np.float32))
         except Exception:
             y_hat_pref = None
+            y_hat_final = None
     
-    # 2) sigma: coupled to y_hat
+    # 2) sigma: coupled to y_hat (damped proximal update)
     if ("sigma" in reg.names()) and bool(getattr(flags, "enable_qstep_update_sigma", True)):
         try:
-            if y_hat_pref is None and ("y_hat" in reg.names()):
-                y_hat_pref = np.asarray(get_block(reg, q_i_new, "y_hat"), dtype=np.float32).reshape(-1)
-                y_hat_pref = coverage_metrics.normalize_to_simplex_nonneg(y_hat_pref)
-            if y_hat_pref is not None:
-                sigma_pref = coverage_metrics.sigma_target_from_y_hat(y_hat_pref, params, flags)
-                set_block(reg, q_i_new, "sigma", np.asarray(sigma_pref, dtype=np.float32))
+            damp_s = bool(getattr(flags, "enable_qstep_damped_sigma", False))
+
+            # choose y reference: prefer y_hat_final (after damping), else current block
+            if y_hat_final is None and ("y_hat" in reg.names()):
+                y_hat_final = np.asarray(get_block(reg, q_i_new, "y_hat"), dtype=np.float32).reshape(-1)
+                y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_hat_final)
+
+            if y_hat_final is not None:
+                sigma_pref = coverage_metrics.sigma_target_from_y_hat(y_hat_final, params, flags)
+
+                if damp_s:
+                    z_minus_u = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32))
+                    sigma_tgt = np.asarray(get_block(reg, z_minus_u, "sigma"), dtype=np.float32).reshape(-1)
+
+                    beta_s = float(getattr(params, "sigma_beta", getattr(params, "y_hat_beta", 1.0)))
+                    if not np.isfinite(beta_s):
+                        beta_s = 1.0
+                    beta_s = float(np.clip(beta_s, 0.0, 1.0))
+
+                    sigma_mix = (1.0 - beta_s) * sigma_tgt + beta_s * np.asarray(sigma_pref, dtype=np.float32).reshape(-1)
+
+                    # optional: enforce coupled lower bound early (z-step will enforce again)
+                    sigma_max = float(getattr(params, "sigma_max", 1.0))
+                    if bool(getattr(flags, "enable_sigma_coupled_to_y", True)):
+                        lo = coverage_metrics.sigma_lower_bound_from_y_hat(y_hat_final, params, flags)
+                        sigma_new = np.clip(sigma_mix, lo, sigma_max)
+                    else:
+                        sigma_new = np.clip(sigma_mix, 0.0, sigma_max)
+
+                    set_block(reg, q_i_new, "sigma", np.asarray(sigma_new, dtype=np.float32))
+                else:
+                    # legacy behavior (hard overwrite)
+                    set_block(reg, q_i_new, "sigma", np.asarray(sigma_pref, dtype=np.float32))
         except Exception:
             pass
     incident_idx: Optional[np.ndarray] = None

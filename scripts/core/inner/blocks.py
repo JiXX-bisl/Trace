@@ -16,7 +16,7 @@ All block access **must** go through :class:`BlockRegistry` slices (no hard-code
 indices in solvers).
 
 Block shapes are defined at the *macro block* level (e.g., ``pos`` is the stacked
-positions of all robots, shape ``(2*N,)`` with a fixed flatten order).
+positions of all robots, shape ``(coord_dim*N,)`` with a fixed flatten order).
 
 Residual Model
 """
@@ -198,7 +198,7 @@ def make_registry(N: int, E: int, G: int, flags: FeatureFlags) -> BlockRegistry:
 
     Macro block shapes (default, can be disabled by flags.enable_*):
 
-    * pos   : (2*N,)
+    * pos   : (coord_dim*N,)
     * cov   : (1,)
     * f_hat : (E,)
     * B_hat : (E,)
@@ -208,7 +208,7 @@ def make_registry(N: int, E: int, G: int, flags: FeatureFlags) -> BlockRegistry:
 
     Turning off any macro block MUST reduce ``total_dim`` .
     """
-
+    coord_dim = flags.coord_dim
     if N <= 0:
         raise ValueError(f"N must be positive, got {N}")
     if E < 0:
@@ -225,7 +225,7 @@ def make_registry(N: int, E: int, G: int, flags: FeatureFlags) -> BlockRegistry:
     blocks: List[BlockDef] = []
     # NOTE: keep deterministic order.
     if enabled("enable_pos"):
-        blocks.append(BlockDef(name="pos", shape=(2 * N,)))
+        blocks.append(BlockDef(name="pos", shape=(coord_dim * N,)))
     if enabled("enable_cov"):
         blocks.append(BlockDef(name="cov", shape=(1,)))
     if enabled("enable_f_hat"):
@@ -485,11 +485,11 @@ def compute_eps_pri(eps_abs: float, eps_rel: float, q: np.ndarray, z: np.ndarray
 
 
 def compute_eps_dual(eps_abs: float, eps_rel: float, u: np.ndarray, eta: float) -> float:
-    """Dual stopping threshold ε_dual.
+    """Dual stopping threshold eps_dual.
 
-    Using scaled dual variables u ∈ R^{N×D} (stacked) and penalty eta (ρ).
+    Using scaled dual variables u \in R^{NxD} (stacked) and penalty eta (rho).
 
-        ε_dual = sqrt(N·D)·ε_abs + ε_rel · ||eta·u||_F
+        ε_dual = sqrt(N·D)·eps_abs + eps_rel · ||eta·u||_F
 
     This matches the stacked variable protocol where u is maintained per robot.
     """
@@ -514,20 +514,21 @@ def compute_eps_dual(eps_abs: float, eps_rel: float, u: np.ndarray, eta: float) 
 # ---------------------------------------------------------------------------
 
 
-def decode_pos(reg: BlockRegistry, z: np.ndarray, N: int) -> np.ndarray:
-    """Decode stacked position block from z to (N,2).
+def decode_pos(reg: BlockRegistry, z: np.ndarray, N: int, coord_dim) -> np.ndarray:
+    """Decode stacked position block from z to (N,coord_dim).
 
-    Requires block 'pos' to exist with shape (2*N,).
+    Requires block 'pos' to exist with shape (coord_dim*N,).
 
     Flatten convention
     ------------------
-    ``pos`` is stored as ``[x0, y0, x1, y1, ..., x_{N-1}, y_{N-1}]``.
+    ``pos`` is stored as ``[x0, y0, x1, y1, ..., x_{N-1}, y_{N-1}]`` 
+                      or ``[x0, y0, z0, x1, y1, z1, ..., x_{N-1}, y_{N-1}, z_{N-1}]``.
     """
 
     if "pos" not in reg.names():
         raise KeyError("Registry does not contain 'pos' block")
     pos = get_block(reg, np.asarray(z), "pos")
-    exp = (2 * N,)
+    exp = (coord_dim * N,)
     if tuple(pos.shape) != exp:
         raise ValueError(f"pos block shape mismatch: got {pos.shape}, expected {exp}")
-    return pos.reshape(N, 2)
+    return pos.reshape(N, coord_dim)

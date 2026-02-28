@@ -20,19 +20,31 @@ from __future__ import annotations
 
 import numpy as np
 
-def _value_at_entropy(frontier_entropy: np.ndarray, xy: np.ndarray) -> float:
+def _value_at_entropy(frontier_entropy: np.ndarray, xyz: np.ndarray) -> float:
     ent = np.asarray(frontier_entropy, dtype=np.float32)
-    if ent.ndim != 2:
+    if ent.ndim == 3:
+        D, H, W = int(ent.shape[0]), int(ent.shape[1]), int(ent.shape[2])
+        x = int(np.round(float(xyz[0])))
+        y = int(np.round(float(xyz[1])))
+        z = int(np.round(float(xyz[2])))
+        if (x < 0) or (x >= W) or (y < 0) or (y >= H) or (z < 0) or (z >= D):
+            return 0.0
+        v = float(ent[z, y, x])
+        if not np.isfinite(v):
+            return 0.0
+        return v
+    elif ent.ndim == 2:
+        H, W = int(ent.shape[0]), int(ent.shape[1])
+        x = int(np.round(float(xyz[0])))
+        y = int(np.round(float(xyz[1])))
+        if (x < 0) or (x >= W) or (y < 0) or (y >= H):
+            return 0.0
+        v = float(ent[y, x])
+        if not np.isfinite(v):
+            return 0.0
+        return v
+    else:
         return 0.0
-    H, W = int(ent.shape[0]), int(ent.shape[1])
-    x = int(np.round(float(xy[0])))
-    y = int(np.round(float(xy[1])))
-    if (x < 0) or (x >= W) or (y < 0) or (y >= H):
-        return 0.0
-    v = float(ent[y, x])
-    if not np.isfinite(v):
-        return 0.0
-    return v
 
 def coverage_group_scores(problem: object, rid: int, pos_xy: np.ndarray) -> np.ndarray:
     """
@@ -44,6 +56,7 @@ def coverage_group_scores(problem: object, rid: int, pos_xy: np.ndarray) -> np.n
       3) If still zero, return all-ones (uniform after normalization).
     """
     _ = rid
+    coord_dim = problem.coord_dim
     G = int(getattr(problem, "G", 0) or 0)
     if G <= 0:
         return np.zeros((0,), dtype=np.float32)
@@ -52,15 +65,15 @@ def coverage_group_scores(problem: object, rid: int, pos_xy: np.ndarray) -> np.n
     ent = np.asarray(getattr(problem, "frontier_entropy", np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
     
     try:
-        p = np.asarray(pos_xy, dtype=np.float32).reshape(2)
+        p = np.asarray(pos_xy, dtype=np.float32).reshape(coord_dim)
     except Exception:
-        p = np.zeros((2,), dtype=np.float32)
+        p = np.zeros((coord_dim,), dtype=np.float32)
     scores = np.zeros((G,), dtype=np.float32)
 
     # --- task-based grouping ---
     task = getattr(problem, "task", None)
     if task is not None:
-        tp = np.asarray(getattr(task, "task_pos", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32).reshape(-1, 2)
+        tp = np.asarray(getattr(task, "task_pos", np.zeros((0, coord_dim), dtype=np.float32)), dtype=np.float32).reshape(-1, coord_dim)
         cid = np.asarray(getattr(task, "cluster_id", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
         T = int(min(tp.shape[0], cid.size))
         if T > 0:
@@ -123,7 +136,7 @@ def normalize_to_simplex_nonneg(vec: np.ndarray) -> np.ndarray:
     v = np.clip(v, 0.0, np.inf)
     s = float(np.sum(v))
     if (not np.isfinite(s)) or s <= 0.0:
-        return (np.ones((G,), dtype=np.float32) / float(G).astype(np.float32))
+        return (np.ones((G,), dtype=np.float32) / float(G)).astype(np.float32, copy=False)
     return (v / s).astype(np.float32, copy=False)
 
 def sigma_target_from_y_hat(y_hat: np.ndarray, params: object, flags: object) -> np.ndarray:

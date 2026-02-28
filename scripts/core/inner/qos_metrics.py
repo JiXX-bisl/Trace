@@ -246,7 +246,8 @@ def summarize_qos_violation(
 def connectivity_score_from_positions(
     candidate_xy: np.ndarray,
     robot_pos: np.ndarray,
-    params: object
+    params: object,
+    coord_dim: int
 ) -> float:
     """
     Fallback connectivity tendency based only on geometry
@@ -255,8 +256,8 @@ def connectivity_score_from_positions(
     Intended to be added into candidate score when enable_qstep_cost_qos_pos is True.
     """
     try: 
-        cand = np.asarray(candidate_xy, dtype=np.float32).reshape(2)
-        rp = np.asarray(robot_pos, dtype=np.float32).reshape(-1, 2)
+        cand = np.asarray(candidate_xy, dtype=np.float32).reshape(coord_dim)
+        rp = np.asarray(robot_pos, dtype=np.float32).reshape(-1, coord_dim)
     except Exception:
         return 0.0
 

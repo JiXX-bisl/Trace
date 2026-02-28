@@ -23,6 +23,7 @@ All block access must go through BlockRegistry helpers.
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, Optional, Tuple
 from dataclasses import replace
 
@@ -173,6 +174,7 @@ def build_problem_snapshot(
         params=params,
         flags=flags_used,
         window=window_new,
+        coord_dim=flags.coord_dim
     )
 
 # =============================================================================
@@ -186,7 +188,6 @@ def solve_inner_cadmm(
 ) -> Tuple[InnerSolution, CadmmWarmStart, CadmmDiagnostics]:
     if rng is None:
         rng = np.random.default_rng()
-
     reg = make_registry(problem.N, problem.E, problem.G, problem.flags)
     D = reg.total_dim
     N = problem.N
@@ -224,19 +225,65 @@ def solve_inner_cadmm(
     # residual balancing
     enable_rb = bool(getattr(problem.flags, "enable_residual_balancing", False))
     # === 在外部初始化的时候需要完成的设置 ===
-    
-    # init
-    z = np.zeros((D,), dtype=np.float32)
-    q = np.zeros((N, D), dtype=np.float32)
-    u = np.zeros((N, D), dtype=np.float32)
 
+    # init
+    # z = np.zeros((D,), dtype=np.float32)
+    # q = np.zeros((N, D), dtype=np.float32)
+    # u = np.zeros((N, D), dtype=np.float32)
+    # if warm_start is not None:
+    #     z0 = np.asarray(warm_start.z, dtype=np.float32)
+    #     q0 = np.asarray(warm_start.q, dtype=np.float32)
+    #     u0 = np.asarray(warm_start.u, dtype=np.float32)
+    #     if z0.shape == (D,): z = z0.copy()
+    #     if q0.shape == (N, D): q = q0.copy()
+    #     if u0.shape == (N, D): u = u0.copy()
+
+
+    # init: prefer warm_start; otherwise initialize z from current snapshot (esp. pos)
+    use_ws = False
     if warm_start is not None:
         z0 = np.asarray(warm_start.z, dtype=np.float32)
         q0 = np.asarray(warm_start.q, dtype=np.float32)
         u0 = np.asarray(warm_start.u, dtype=np.float32)
-        if z0.shape == (D,): z = z0.copy()
-        if q0.shape == (N, D): q = q0.copy()
-        if u0.shape == (N, D): u = u0.copy()
+        # 重要：必须三者同时匹配才算有效 warm start
+        use_ws = (z0.shape == (D,)) and (q0.shape == (N, D)) and (u0.shape == (N, D))
+        if use_ws:
+            z, q, u = z0.copy(), q0.copy(), u0.copy()
+        
+
+    if not use_ws:
+        # 关键修复：不要用全 0 的 z/q/u；至少把 pos 初始化到当前 robot_pos
+        z = np.zeros((D,), dtype=np.float32)
+        u = np.zeros((N, D), dtype=np.float32)
+
+        # --- snapshot -> z ---
+        if "pos" in reg.names():
+            rp = np.asarray(problem.robot_pos, dtype=np.float32)
+            # ensure shape (N, coord_dim)
+            if rp.ndim != 2 or rp.shape[0] != N:
+                raise ValueError(f"problem.robot_pos must be (N,coord_dim), got {rp.shape}")
+            if rp.shape[1] != problem.coord_dim:
+                # 容错：不足则补 0，过多则截断
+                if rp.shape[1] < problem.coord_dim:
+                    pad = np.zeros((N, problem.coord_dim - rp.shape[1]), dtype=np.float32)
+                    rp = np.concatenate([rp, pad], axis=1)
+                else:
+                    rp = rp[:, :problem.coord_dim]
+            # pos block shape = (coord_dim*N,)
+            set_block(reg, z, "pos", rp.reshape(-1))
+
+        if "cov" in reg.names():
+            set_block(reg, z, "cov", np.asarray([float(problem.coverage)], dtype=np.float32))
+
+        if "y_hat" in reg.names():
+            G = reg.shape("y_hat")[0]
+            if G > 0:
+                set_block(reg, z, "y_hat", np.full((G,), 1.0 / float(G), dtype=np.float32))
+
+        # 其它块（sigma/f_hat/B_hat/r_hat）保持 0 即可
+
+        # 每个机器人本地变量 q 初始化为 z（避免 q-step 被 0 吸到地图角落）
+        q = np.tile(z[None, :], (N, 1)).astype(np.float32, copy=False)
 
     res_model = make_residual_model(problem, reg, problem.flags)
 
@@ -422,7 +469,7 @@ def solve_inner_cadmm(
             eta = float(eta_new)
             u = np.asarray(u_scaled, dtype=np.float32)
 
-    next_pos = decode_pos(reg, z, problem.N) if "pos" in reg.names() else np.asarray(problem.robot_pos, dtype=np.float32)
+    next_pos = decode_pos(reg, z, problem.N, problem.coord_dim) if "pos" in reg.names() else np.asarray(problem.robot_pos, dtype=np.float32)
 
     sol = InnerSolution(next_pos=next_pos, z=z, q=q, u=u)
     ws = CadmmWarmStart(z=z.copy(), u=u.copy(), q=q.copy())

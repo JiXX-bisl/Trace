@@ -26,6 +26,7 @@ class Task:
     id: int
     x: int
     y: int
+    z: int
     start_step: int
     ddl_step: int
     status: str = "pending"  # pending | observed | completed | failed
@@ -94,6 +95,10 @@ class CadmmParams:
     # QoS normalization
     budget_cache_ema: float = 1.0
 
+    # Beta for qstep added by JiXX at 20260227
+    y_hat_beta: float = 0.1
+    sigma_beta: float = 0.05
+
 
 @dataclass
 class LinkState:
@@ -148,25 +153,28 @@ class FeatureFlags:
     enable_staleness_engine: bool = True    # 启用last_seen/is_stale/active_hint 的内部维护
 
     # q-step switches
-    enable_qstep_admm_term: bool = True
+    enable_qstep_admm_term: bool = False
     enable_qstep_admm_move: bool = False
     enable_qstep_admm_explore: bool = False
     enable_qstep_admm_task: bool = False
     enable_qstep_admm_qos: bool = False 
     enable_qstep_admm_repulsion: bool = False
+    # enable beta
+    enable_qstep_damped_y_hat: bool = False
+    enable_qstep_damped_sigma: bool = False
 
     # q-step block-wise update
-    enable_qstep_cost_move: bool = False        # 移动代价权重开关
-    enable_qstep_cost_explore: bool = False     # 探索得分权重开关
-    enable_qstep_cost_task: bool = False        # 任务紧急程度权重开关
-    enable_qstep_cost_repulsion: bool = False   # 排斥代价权重开关
-    enable_qstep_cost_qos_pos: bool = False
-    enable_qstep_update_y_hat: bool = False
-    enable_qstep_update_B_hat: bool = False
-    enable_qstep_update_f_hat: bool = False
-    enable_qstep_update_r_hat: bool = False
-    enable_qstep_update_sigma: bool = False
-    enable_rhat_include_coverage: bool = False
+    enable_qstep_cost_move: bool = True        # 移动代价权重开关
+    enable_qstep_cost_explore: bool = True     # 探索得分权重开关
+    enable_qstep_cost_task: bool = True        # 任务紧急程度权重开关
+    enable_qstep_cost_repulsion: bool = True   # 排斥代价权重开关
+    enable_qstep_cost_qos_pos: bool = True     # qos代价权重开关
+    enable_qstep_update_y_hat: bool = True
+    enable_qstep_update_B_hat: bool = True
+    enable_qstep_update_f_hat: bool = True
+    enable_qstep_update_r_hat: bool = True
+    enable_qstep_update_sigma: bool = True
+    enable_rhat_include_coverage: bool = True
     # q-step 会按这些 flags 决定是否把 y_hat/sigma/B_hat/f_hat/r_hat 写回 q_i_new
 
     # residual 
@@ -224,6 +232,8 @@ class FeatureFlags:
     async_ratio: float = 1.0
     
     coupled_primal_source: str = "z"  # | "q_mean"
+
+    coord_dim: int = 2
 
 @dataclass(frozen=True)
 class BlockDef:
@@ -285,7 +295,7 @@ class LinkSnapshot:
 
 @dataclass
 class TaskSnapshot:
-    task_pos: np.ndarray       # (T, 2)  float/int grid coords
+    task_pos: np.ndarray       # (T, 2) -> (T, 3)  float/int grid coords
     deadline: np.ndarray       # (T,)
     priority: np.ndarray       # (T,)
     cluster_id: np.ndarray     # (T,) int, in [0,G-1]
@@ -299,11 +309,11 @@ class CadmmProblem:
     T: int                    # tasks
 
     # inputs
-    robot_pos: np.ndarray               # (N, 2)
-    candidate_moves: List[np.ndarray]   # len N, each (Mi, 2)
+    robot_pos: np.ndarray               # (N, 2) -> (N, 3)
+    candidate_moves: List[np.ndarray]   # len N, each (Mi, 2) -> (Mi, 3)
     coverage: float                     
-    frontier_entropy: np.ndarray        # (H, W)
-    repulsion_grad: np.ndarray          # (N, 2)
+    frontier_entropy: np.ndarray        # (H, W) -> (Z, H, W)
+    repulsion_grad: np.ndarray          # (N, 2) -> (N, 3)
 
     link: LinkSnapshot
     task: TaskSnapshot
@@ -312,11 +322,13 @@ class CadmmProblem:
     params: "CadmmParams"
     flags: FeatureFlags
     window: "CommWindowState"
+
+    coord_dim: int
     
 # Cadmm inner solution
 @dataclass
 class InnerSolution:
-    next_pos: np.ndarray        # (N,2) decoded from z_pos or q_pos
+    next_pos: np.ndarray        # (N, 2) -> (N, 3) decoded from z_pos or q_pos
     z: np.ndarray               # (D,)
     q: np.ndarray               # (N,D)
     u: np.ndarray               # (N,D)

@@ -537,12 +537,26 @@ def project_blocks(
         arr_np = np.asarray(arr)
         shp = arr_np.shape
         v = arr_np.reshape(-1).astype(np.float32, copy=False)
+        # 1) violation recording before projcetion
         if cons is None or len(cons) == 0:
             out[name] = arr_np.copy()
-            diag[name] = {"iters_used": 0, "violations": [], "max_violation": 0.0, "delta_norm": 0.0}
+            diag[name] = {"iters_used": 0, "violations": [], "max_violation": 0.0, "delta_norm": 0.0, 
+                          "pre_violations": [], "pre_max_violation": 0.0, "corr_norm": 0.0, "corr_inf": 0.0}
             continue
+        pre_viols = [constraint_violation(v, c) for c in cons]
+        pre_maxv = float(np.max(pre_viols)) if pre_viols else 0.0
+        # 2) projection
         x, info = project_to_constraints(v, cons, method=method, iters=iters, tol=tol, poly_method=poly_method)
+        # 3) porjection violation value
+        dx = x - v
+        corr_norm = float(np.linalg.norm(dx)) if dx.size else 0.0
+        corr_inf = float(np.max(np.abs(dx))) if dx.size else 0.0
         out[name] = x.reshape(shp).astype(arr_np.dtype, copy=False)
+        info = dict(info)
+        info["pre_violations"] = pre_viols
+        info["pre_max_violation"] = pre_maxv
+        info["corr_norm"] = corr_norm
+        info["corr_inf"] = corr_inf
         diag[name] = info
     return out, diag
 
@@ -565,8 +579,21 @@ def project_one_block(
     shp = a.shape
     v = a.reshape(-1).astype(np.float32, copy=False)
     if cons_list is None or len(cons_list) == 0:
-        return a.copy(), {"iters_used": 0, "violations": [], "max_violation": 0.0, "delta_norm": 0.0}
+        return a.copy(), {
+            "iters_used": 0, "violations": [], "max_violation": 0.0, "delta_norm": 0.0,
+            "pre_violations": [], "pre_max_violation": 0.0, "corr_norm": 0.0, "corr_inf": 0.0,
+        }
+    pre_viols = [constraint_violation(v, c) for c in cons_list]
+    pre_maxv = float(np.max(pre_viols)) if pre_viols else 0.0
     x, info = project_to_constraints(v, cons_list, method=method, iters=iters, tol=tol, poly_method=poly_method)
+    dx = x - v
+    corr_norm = float(np.linalg.norm(dx)) if dx.size else 0.0
+    corr_inf = float(np.max(np.abs(dx))) if dx.size else 0.0
+    info = dict(info)
+    info["pre_violations"] = pre_viols
+    info["pre_max_violation"] = pre_maxv
+    info["corr_norm"] = corr_norm
+    info["corr_inf"] = corr_inf
     return x.reshape(shp).astype(a.dtype, copy=False), info
 
 # ---------------------------------------------------------------------------
