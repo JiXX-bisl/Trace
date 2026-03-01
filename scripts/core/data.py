@@ -362,3 +362,11 @@ class CadmmDiagnostics:
     eta_hist: List[float]
     proj_violation: Dict[str, float]
 
+
+# 待添加量
+# rep_mode = getattr(params, "rep_mode", "quad")
+# rep_d0   = float(getattr(params, "rep_d0", 3.0))
+# rep_sig  = float(getattr(params, "rep_sigma", 1.0))
+# sigma_rep = {"mode": rep_mode, "d0": rep_d0, "sigma": rep_sig}
+
+# rep_cost = cost_repulsion(cand, current_pos, problem.robot_pos, sigma_rep, rep_w)

@@ -15,6 +15,8 @@ you should only need to replace ``edge_quality_weights`` and/or
 from __future__ import annotations
 
 import numpy as np
+from scripts.utils.hops import compute_comm_state_minhop_minlen
+
 
 def incident_edge_indices(edges: np.ndarray, rid: int) -> np.ndarray:
     """
@@ -242,6 +244,47 @@ def summarize_qos_violation(
     if not np.isfinite(out):
         return 0.0
     return float(np.clip(out, 0.0, 1.0))
+
+def connectivity_score_capacity(
+    *,
+    rid: int,
+    cand_idx: int,
+    caps_to: np.ndarray,   # (M,N)
+    c_low: float,
+    qos_w: float
+) -> float:
+    """
+    Capacity-violation QoS cost in [0,1] (averaged over other nodes).
+    caps_to[cand_idx, j] = cap(rid->j) under this candidate position.
+    """
+    caps_to = np.asarray(caps_to, dtype=np.float32)
+    if caps_to.ndim != 2 or caps_to.shape[0] == 0:
+        return 0.0
+
+    M, N = int(caps_to.shape[0]), int(caps_to.shape[1])
+    if cand_idx < 0 or cand_idx >= M:
+        return 1.0  # out-of-range -> treat as bad
+
+    c_low = float(c_low)
+    c_low = max(c_low, 1e-6)
+
+    sum_cost = 0.0
+    denom = 0
+
+    row = caps_to[cand_idx]  # (N,)
+    for j in range(N):
+        if j == rid:
+            continue
+        c_ij = float(row[j])
+        # unreachable usually gives c_ij=0 -> full penalty (good)
+        v = max(0.0, (c_low - c_ij) / c_low)
+        if v > 1.0:
+            v = 1.0
+        sum_cost += v
+        denom += 1
+
+    return qos_w * float(sum_cost / max(denom, 1))
+
 
 def connectivity_score_from_positions(
     candidate_xy: np.ndarray,
