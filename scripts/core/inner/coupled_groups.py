@@ -75,7 +75,27 @@ def apply_coupled_primal(
             return np.zeros((G,), dtype=np.float32)
         blocks = getattr(reg, "unpack")(z_src)
         sigma = np.asarray(blocks.get("sigma", np.zeros((G,), dtype=np.float32)), dtype=np.float32).reshape(G)
-        y_hat = np.asarray(blocks.get("y_hat", np.zeros((G,), dtype=np.float32)), dtype=np.float32).reshape(G)
+        y_hat_full = np.asarray(blocks.get("y_hat", np.zeros((G,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+        # y_hat may be time-stacked (G*T,); reduce to (G,) for coupled group residual
+        if y_hat_full.size == G:
+            y_hat = y_hat_full
+        else:
+            red = str(getattr(flags, "sigma_y_reduce", "max")).lower()
+            if (G > 0) and (y_hat_full.size % G == 0) and (y_hat_full.size > 0):
+                T = int(y_hat_full.size // G)
+                yy = y_hat_full.reshape(G, T)
+                if red == "mean":
+                    y_hat = np.mean(yy, axis=1)
+                elif red == "sum":
+                    y_hat = np.sum(yy, axis=1)
+                else:
+                    y_hat = np.max(yy, axis=1)
+            else:
+                # best-effort truncate/pad
+                if y_hat_full.size > G:
+                    y_hat = y_hat_full[:G]
+                else:
+                    y_hat = np.pad(y_hat_full, (0, G - y_hat_full.size))
 
         from scripts.core.inner.coverage_metrics import sigma_lower_bound_from_y_hat
 

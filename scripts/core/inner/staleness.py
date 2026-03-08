@@ -4,14 +4,35 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-from scripts.core.data import LinkSnapshot, CommWindowState
+from scripts.core.data import LinkSnapshot, CommWindowState, FeatureFlags
+
+def _orient_edge(i: int, j: int, root: int, mode: str) -> Tuple[int, int]:
+    m = str(mode or "min_id")
+    if m == "as_is":
+        return int(i), int(j)
+    if m == "root":
+        if i == root and j != root:
+            return int(i), int(j)
+        if j == root and i != root:
+            return int(j), int(i)
+        a = int(min(i, j)); b = int(max(i, j))
+        return a, b
+    a = int(min(i, j)); b = int(max(i, j))
+    return a, b
 
 
-def _edge_key(i: int, j: int) -> tuple[int, int]:
-    # 推荐无向稳定 key（与你当前 link.edges 可能 i<j 一致，但更稳）
-    return (i, j) if i <= j else (j, i)
+def _edge_key(i: int, j: int, window_state: CommWindowState, flags: FeatureFlags) -> Tuple[int, int]:
+    # When we orient+dedup edges, cache keys must be directed (src,dst) to match edges order.
+    orient = bool(getattr(flags, "assembled_orient_undirected_edges", False))
+    if not orient:
+        return (i, j) if i <= j else (j, i)
+    # root id: prefer reachability root if available (set by staleness engine), else assembled_root_id
+    root = int(getattr(window_state, "reachability_root_id", getattr(flags, "assembled_root_id", 0)))
+    mode = str(getattr(flags, "assembled_edge_orientation_mode", "min_id"))
+    src, dst = _orient_edge(int(i), int(j), root=root, mode=mode)
+    return (src, dst)
 
-def update_last_seen(step: int, link_current: LinkSnapshot, window_state: CommWindowState) -> None:
+def update_last_seen(step: int, link_current: LinkSnapshot, window_state: CommWindowState, flags: FeatureFlags) -> None:
     last_seen = getattr(window_state, "last_seen_step", None)
     if not isinstance(last_seen, dict):
         last_seen = {}
@@ -19,7 +40,7 @@ def update_last_seen(step: int, link_current: LinkSnapshot, window_state: CommWi
 
     edges = np.asarray(link_current.edges, dtype=np.int32).reshape(-1, 2)
     for (i, j) in edges:
-        k = _edge_key(int(i), int(j))
+        k = _edge_key(int(i), int(j), window_state, flags)
         last_seen[k] = int(step)
 
 
@@ -27,6 +48,7 @@ def compute_is_stale(
     step: int,
     link_frozen: LinkSnapshot,
     window_state: CommWindowState,
+    flags: FeatureFlags,
     ttl_steps: int,
     strict: bool = False
 ) -> np.ndarray:
@@ -42,7 +64,7 @@ def compute_is_stale(
     out = np.zeros((E,), dtype=bool)
     ttl = int(max(ttl_steps, 0))
     for e, (i, j) in enumerate(edges):
-        k = _edge_key(int(i), int(j))
+        k = _edge_key(int(i), int(j), window_state, flags)
         ls = int(last_seen.get(k, base))
         dt = int(step) - ls
         out[e] = (dt >= ttl) if strict else (dt > ttl)

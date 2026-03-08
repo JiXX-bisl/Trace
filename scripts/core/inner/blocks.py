@@ -23,7 +23,7 @@ Residual Model
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Sequence
 import abc
 
 import numpy as np
@@ -193,7 +193,7 @@ def _validate_shape_tuple(shape: object, *, name: str) -> Tuple[int, ...]:
 # ---------------------------------------------------------------------------
 
 
-def make_registry(N: int, E: int, G: int, flags: FeatureFlags) -> BlockRegistry:
+def make_registry(N: int, E: int, G: int, flags: FeatureFlags, *, T_horizon: int = 1) -> BlockRegistry:
     """Factory to build registry from problem sizes and FeatureFlags.
 
     Macro block shapes (default, can be disabled by flags.enable_*):
@@ -202,7 +202,8 @@ def make_registry(N: int, E: int, G: int, flags: FeatureFlags) -> BlockRegistry:
     * cov   : (1,)
     * f_hat : (E,)
     * B_hat : (E,)
-    * y_hat : (G,)
+    * y_hat : (G,) or (G * T_horizon,) if time-stacked is enabled
+    * s_hat : (N, dy) if enable_y_avg_assembly is enabled (dy = size(y_hat))
     * sigma : (G,)
     * r_hat : (N,)
 
@@ -236,10 +237,51 @@ def make_registry(N: int, E: int, G: int, flags: FeatureFlags) -> BlockRegistry:
         if E <= 0:
             raise ValueError("enable_B_hat=True but E<=0; would create an empty block")
         blocks.append(BlockDef(name="B_hat", shape=(E,)))
+    y_dim: Optional[int] = None  # flattened dim of y_hat, used by s_hat when avg-assembly is enabled
     if enabled("enable_y_hat"):
         if G <= 0:
             raise ValueError("enable_y_hat=True but G<=0; would create an empty block")
-        blocks.append(BlockDef(name="y_hat", shape=(G,)))
+        # blocks.append(BlockDef(name="y_hat", shape=(G,)))
+        time_stacked = bool(getattr(flags, "enable_time_stacked_y_hat", False))
+        if time_stacked:
+            try: 
+                th = int(T_horizon)
+            except Exception:
+                th = 1
+            if th <= 0:
+                raise ValueError(f"T_horizon must be positive when time-stacking y_hat got {th}")
+            # blocks.append(BlockDef(name="y_hat", shape=(G*th,)))
+            y_dim = int(G * th)
+            blocks.append(BlockDef(name="y_hat", shape=(y_dim,)))
+        else:
+            # blocks.append(BlockDef(name="y_hat", shape=(G,)))
+            y_dim = int(G)
+            blocks.append(BlockDef(name="y_hat", shape=(y_dim,)))
+    # ------------------------------------------------------------------
+    # Strict theory alignment: average-assembly for Y block
+    # Add explicit local contribution block s_hat (stacked by robot):
+    #   s_hat has shape (N, dy), where dy = size(y_hat) = G*T (or G when T=1).
+    # Meaning:
+    #   - q_step writes s_i = Phi_i(theta_i) into s_hat[rid]
+    #   - solver forms sum_s ONLY from q_prev.s_hat (cached), satisfying async/TTL consistency
+    #   - Y residual becomes mean(s_hat) - y_hat (no "consensus y" ambiguity)
+    # ------------------------------------------------------------------
+    if bool(getattr(flags, "enable_y_avg_assembly", False)):
+        if not enabled("enable_y_hat"):
+            raise ValueError("enable_y_avg_assembly=True requires enable_y_hat=True")
+        if y_dim is None or y_dim <= 0:
+            raise ValueError("enable_y_avg_assembly=True but y_hat dim is invalid (y_dim is None/<=0)")
+        # Hard requirement: dy must be divisible by G to interpret time stacking (dy=G*T)
+        if G <= 0 or (y_dim % G) != 0:
+            raise ValueError(f"s_hat requires dy%G==0, got dy={y_dim}, G={G}")
+        blocks.append(BlockDef(name="s_hat", shape=(N, y_dim)))
+
+    # Route-B: theta block (stacked by robot, each row is a simplex variable)
+    if bool(getattr(flags, "enable_theta", False)):
+        M = int(getattr(flags, "theta_dim", 0))
+        if M <= 0:
+            raise ValueError("enable_theta=True but theta_dim<=0")
+        blocks.append(BlockDef(name="theta", shape=(N, M)))        
     if enabled("enable_sigma"):
         if G <= 0:
             raise ValueError("enable_sigma=True but G<=0; would create an empty block")
@@ -308,10 +350,26 @@ def set_block(reg: BlockRegistry, x: np.ndarray, name: str, value: np.ndarray) -
 
 
 # ---------------------------------------------------------------------------
+# Equality-consensus (z_eq) helpers
+# ---------------------------------------------------------------------------
+def eq_block_names() -> Tuple[str, ...]:
+    """Canonical marco-block names that participate in quality consensus (z_eq)"""
+    return ("f_hat", "B_hat", "y_hat", "r_hat")
+
+def eq_mask(reg: BlockRegistry, *, names: Optional[Sequence[str]] = None) -> np.ndarray:
+    """Build a boolean mask over the flat vector selecting equality-consenssus entries."""
+    use = list(eq_block_names() if names is None else list(names))
+    present = set(reg.names())
+    m = np.zeros((reg.total_dim,), dtype=np.bool_)
+    for bn in use:
+        if bn not in present: continue
+        sl = reg.sl(str(bn))
+        m[sl] = True
+    return m
+
+# ---------------------------------------------------------------------------
 # Residual Models
 # ---------------------------------------------------------------------------
-
-
 class ResidualModel(abc.ABC):
     """Abstract residual model interface for A/B migration."""
 
@@ -397,12 +455,20 @@ class LinearResidual(ResidualModel):
         ss = 0.0
         include_diag = bool(getattr(self.flags, "include_diag_groups_in_stop", False))
         include_coupled = bool(getattr(self.flags, "include_coupled_groups_in_stop", False))
+        # row-bolocks that should contribute to the total norm when enabled
+        # These are constraint residuals from the linear assembly 
+        # include_theory_rows = bool(getattr(self.flags, "enable_theory_mode", False))
+        include_theory_rows = bool(getattr(self.flags, "enable_theory_mode", False)) or bool(getattr(self.flags, "enable_y_avg_assembly", False))
+        theory_rows = {"S", "C", "Y", "R"}
         reg_names = set(reg.names())
         for name in self.assembly.names:
             rv = self.assembly.apply_primal(name, q, z, reg)
             n = float(np.linalg.norm(np.asarray(rv, dtype=np.float32).reshape(-1), ord=2))
             norms[name] = n
             if name in reg_names:
+                ss += n * n
+                continue
+            if include_theory_rows and name in theory_rows:
                 ss += n * n
                 continue
             if name.startswith("diag_") and include_diag:
@@ -420,12 +486,18 @@ class LinearResidual(ResidualModel):
         ss = 0.0
         include_diag = bool(getattr(self.flags, "include_diag_groups_in_stop", False))
         include_coupled = bool(getattr(self.flags, "include_coupled_groups_in_stop", False))
+        include_theory_rows = bool(getattr(self.flags, "enable_theory_mode", False))
+        include_theory_rows = bool(getattr(self.flags, "enable_theory_mode", False)) or bool(getattr(self.flags, "enable_y_avg_assembly", False))
+        theory_rows = {"S", "C", "Y", "R"}
         reg_names = set(reg.names())
         for name in self.assembly.names:
             rv = self.assembly.apply_dual(name, z, z_prev, float(eta), reg)
             n = float(np.linalg.norm(np.asarray(rv, dtype=np.float32).reshape(-1), ord=2))
             norms[name] = n
             if name in reg_names:
+                ss += n * n
+                continue
+            if include_theory_rows and name in theory_rows:
                 ss += n * n
                 continue
             if name.startswith("diag_") and include_diag:

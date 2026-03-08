@@ -1,7 +1,10 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Callable
 import numpy as np
-
+import os
+import json
+import time
+from pathlib import Path
 
 
 @dataclass
@@ -75,10 +78,15 @@ class CadmmParams:
     qos_improve_w: float
     qos_degrade_w: float
 
+    obst_w: float
+    rho: float
+
     urgency_w: float         # 任务紧急程度权重
 
     rep_w: float             # 势能权重
     rep_sigma: float         # 机器人节点距离势能
+
+    qos_w: float
 
     # new added by JiXX at 20260225
     staleness_strict: bool = False  # stale判定开关
@@ -97,8 +105,21 @@ class CadmmParams:
 
     # Beta for qstep added by JiXX at 20260227
     y_hat_beta: float = 0.1
-    sigma_beta: float = 0.05
+    sigma_beta: float = 0.0
 
+    # theta QP projected gradient settings
+    # Enable only when flags.enable_theory_mode and flags.enable_theta
+    theta_pg_iters: int = 8             # projected gradient iterations
+    theta_eta_y: float = 1.0            # eta_y = theta_eta_y * params.eta
+    theta_eta_prior: float = 0.1        # stabilizer: eta_theta * || theta - theta_prev ||^2
+    theta_step: Optional[float] = None  # None -> auto step size
+    
+    # new added by JiXX at 20260302
+    los_max_dist: float = 15.0
+    C_max: float = 30.0
+    # Y average-assembly penalty scaling (for strict theory alignment):
+    # eta_y = eta_y_avg_scale * params.eta
+    eta_y_avg_scale: float = 1.0
 
 @dataclass
 class LinkState:
@@ -159,6 +180,7 @@ class FeatureFlags:
     enable_qstep_admm_task: bool = False
     enable_qstep_admm_qos: bool = False 
     enable_qstep_admm_repulsion: bool = False
+    enable_qstep_cost_obstacles: bool = False
     # enable beta
     enable_qstep_damped_y_hat: bool = False
     enable_qstep_damped_sigma: bool = False
@@ -189,6 +211,29 @@ class FeatureFlags:
     # diagnostics
     log_block_residuals: bool = True
     log_projection_violation: bool = True
+
+    # Theory-alignment switches (all disabled by default for backward compat)
+    # enable_theory_mode:
+    #   - When True, solver/residual should follow the document convention:
+    #     u-step and residuals are updated against z_eq (consensus variable)
+    enable_theory_mode: bool = False
+    # enable_sigma_y_joint_polytope:
+    #   - When True, z-step should project (y_hat, sigma) jointly onto the
+    #     polytope implied by the theory coupling constraints.
+    enable_sigma_y_joint_polytope: bool = False
+    #   - In theory mode, y_hat should use box constraint [0,1] (not simplex).
+    theory_y_hat_box_only: bool = False
+     #   - Prepare for strict alignment where y_hat is stacked over time: dim(y_hat) = |G| * T_horizon.
+    enable_time_stacked_y_hat: bool = False
+    # Route-B: convexified discrete action weights theta
+    enable_theta: bool = False
+    theta_dim: int = 0
+    enable_qstep_update_theta: bool = True
+    # execution-layer option: whether to execute argmax(theta) as a discrete action
+    theta_use_argmax_exec: bool = True
+    # Strict theory alignment: Y-block uses average-assembly (mean(s_hat) - y_hat) instead of consensus (q_y - z_y)
+    # Enabled only when enable_theory_mode and enable_theta are also enabled.
+    enable_y_avg_assembly: bool = False
 
     # new added by JiXX at 20260225
     reachability_root_id: int = 0  # 外部赋值 代表目标机器人id
@@ -305,25 +350,48 @@ class CadmmProblem:
     # static sizes
     N: int                    # number of robots
     E: int                    # links in snapshot
-    G: int                    # groups for y_hat
-    T: int                    # tasks
+    G: int                    # number of groups for y_hat
+    T: int                    # number of tasks
 
     # inputs
+    robots: Any
     robot_pos: np.ndarray               # (N, 2) -> (N, 3)
     candidate_moves: List[np.ndarray]   # len N, each (Mi, 2) -> (Mi, 3)
     coverage: float                     
     frontier_entropy: np.ndarray        # (H, W) -> (Z, H, W)
-    repulsion_grad: np.ndarray          # (N, 2) -> (N, 3)
+    grid_gain: np.ndarray
+    frontier_pts: np.ndarray
+    # repulsion_grad: np.ndarray          # (N, 2) -> (N, 3)
 
     link: LinkSnapshot
     task: TaskSnapshot
+
+    obstacle_lo: np.ndarray
+    obstacle_hi: np.ndarray
 
     # reg: BlockRegistry
     params: "CadmmParams"
     flags: FeatureFlags
     window: "CommWindowState"
 
+    is_los_fn: Callable[[np.ndarray, np.ndarray], bool]
+
     coord_dim: int
+    # new added
+    K: Optional[int] = None
+    T_horizon: int = 1
+
+    def __post_init__(self) -> None:
+        # Backward compat: if caller only provides legacy T, mirror to K.
+        if self.K is None: self.K = int(self.T)
+        # Keep legacy T coherent for old code paths that still read problem T
+        if (int(self.T) <= 0) and (self.K is not None): self.T = int(self.K)
+        # Sanitize time horizon
+        try:
+            self.T_horizon = int(self.T_horizon)
+        except Exception:
+            self.T_horizon = 1
+        if self.T_horizon < 1: self.T_horizon = 1
     
 # Cadmm inner solution
 @dataclass
@@ -370,3 +438,350 @@ class CadmmDiagnostics:
 # sigma_rep = {"mode": rep_mode, "d0": rep_d0, "sigma": rep_sig}
 
 # rep_cost = cost_repulsion(cand, current_pos, problem.robot_pos, sigma_rep, rep_w)
+
+# =============================================================================
+# Cadmm logging (rollout-level aggregation)
+# =============================================================================
+
+def _to_py(v: Any):
+    """Best-effort conversion to JSON-serializable python types."""
+    if v is None:
+        return None
+    if isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        # store small arrays inline; large arrays should go to .npz
+        if v.size <= 64:
+            return v.tolist()
+        return {"__ndarray__": True, "shape": list(v.shape), "dtype": str(v.dtype)}
+    if isinstance(v, dict):
+        return {str(k): _to_py(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_to_py(x) for x in v]
+    # dataclass?
+    try:
+        from dataclasses import asdict, is_dataclass
+        if is_dataclass(v):
+            return _to_py(asdict(v))
+    except Exception:
+        pass
+    return str(v)
+
+@dataclass
+class CadmmLogConfig:
+    """Logging configuration.
+
+    level:
+      - 'lite': store per-iter scalars + selected z-block trajectories.
+      - 'full': additionally store z/q/u (optionally downcasted) every `stride`.
+    """
+    level: str = "lite"             # 'lite' | 'full'
+    stride: int = 1                 # store every k%stride==0
+    store_blocks: Tuple[str, ...] = ("pos", "f_hat", "B_hat", "y_hat", "sigma", "r_hat")
+    store_full_state: bool = False  # store z/q/u arrays (can be huge)
+    state_dtype: str = "float32"    # 'float32' | 'float16'
+    save_compressed: bool = True
+
+@dataclass
+class CadmmRunLog:
+    """One inner C-ADMM solve (one snapshot / one env step)."""
+    run_id: int
+    rollout_step: int
+    mode: str                        # 'theory' | 'legacy'
+    timestamp: float
+
+    # Snapshot meta (small; arrays go to npz if needed)
+    N: int
+    E: int
+    G: int
+    K: int
+    T_horizon: int
+    coord_dim: int
+    block_order: List[str] = field(default_factory=list)
+    block_slices: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+
+    flags: Dict[str, Any] = field(default_factory=dict)
+    params: Dict[str, Any] = field(default_factory=dict)
+    window: Dict[str, Any] = field(default_factory=dict)
+
+    # Initial state (optional)
+    z0: Optional[np.ndarray] = None
+    q0: Optional[np.ndarray] = None
+    u0: Optional[np.ndarray] = None
+
+    # Per-iter scalars
+    it_k: List[int] = field(default_factory=list)
+    it_eta: List[float] = field(default_factory=list)
+    it_r_stop: List[float] = field(default_factory=list)
+    it_s_stop: List[float] = field(default_factory=list)
+    it_eps_pri: List[float] = field(default_factory=list)
+    it_eps_dual: List[float] = field(default_factory=list)
+
+    # Per-iter per-block vectors (aligned to block_order)
+    it_r_by_block: List[np.ndarray] = field(default_factory=list)
+    it_s_by_block: List[np.ndarray] = field(default_factory=list)
+    it_proj_vio: List[np.ndarray] = field(default_factory=list)
+
+    # Async masks
+    it_active_mask: List[np.ndarray] = field(default_factory=list)
+    it_u_mask: List[np.ndarray] = field(default_factory=list)
+
+    # Coupled pass markers / summaries
+    it_coupled: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Selected z-block trajectories (aligned to store_blocks)
+    it_z_blocks: Dict[str, List[np.ndarray]] = field(default_factory=dict)
+
+    # Optional full state trajectories
+    it_z: List[np.ndarray] = field(default_factory=list)
+    it_q: List[np.ndarray] = field(default_factory=list)
+    it_u: List[np.ndarray] = field(default_factory=list)
+
+    # Final outputs (stored once)
+    final_next_pos: Optional[np.ndarray] = None
+    final_z: Optional[np.ndarray] = None
+    final_q: Optional[np.ndarray] = None
+    final_u: Optional[np.ndarray] = None
+    final_diag: Dict[str, Any] = field(default_factory=dict)
+
+    def append_iter(
+        self,
+        *,
+        k: int,
+        eta: float,
+        r_stop: float,
+        s_stop: float,
+        eps_pri: float,
+        eps_dual: float,
+        block_order: List[str],
+        r_by_block: Dict[str, float],
+        s_by_block: Dict[str, float],
+        proj_violation: Dict[str, float],
+        active_mask: Optional[np.ndarray],
+        u_mask: Optional[np.ndarray],
+        coupled_summary: Optional[Dict[str, Any]],
+        z: Optional[np.ndarray],
+        q: Optional[np.ndarray],
+        u: Optional[np.ndarray],
+        store_blocks: Tuple[str, ...],
+        store_full_state: bool,
+        state_dtype: str,
+    ) -> None:
+        self.it_k.append(int(k))
+        self.it_eta.append(float(eta))
+        self.it_r_stop.append(float(r_stop))
+        self.it_s_stop.append(float(s_stop))
+        self.it_eps_pri.append(float(eps_pri))
+        self.it_eps_dual.append(float(eps_dual))
+
+        # vectors aligned to block order
+        r_vec = np.zeros((len(block_order),), dtype=np.float32)
+        s_vec = np.zeros((len(block_order),), dtype=np.float32)
+        p_vec = np.zeros((len(block_order),), dtype=np.float32)
+        for ii, name in enumerate(block_order):
+            r_vec[ii] = float(r_by_block.get(name, 0.0) or 0.0)
+            s_vec[ii] = float(s_by_block.get(name, 0.0) or 0.0)
+            p_vec[ii] = float(proj_violation.get(name, 0.0) or 0.0)
+        self.it_r_by_block.append(r_vec)
+        self.it_s_by_block.append(s_vec)
+        self.it_proj_vio.append(p_vec)
+
+        if active_mask is not None:
+            self.it_active_mask.append(np.asarray(active_mask, dtype=np.uint8).copy())
+        if u_mask is not None:
+            self.it_u_mask.append(np.asarray(u_mask, dtype=np.uint8).copy())
+
+        self.it_coupled.append(dict(coupled_summary or {}))
+
+        # Selected z-blocks
+        if (z is not None) and (store_blocks is not None):
+            for name in store_blocks:
+                if name not in self.block_slices:
+                    continue
+                sl0, sl1 = self.block_slices[name]
+                blk = np.asarray(z[sl0:sl1], dtype=np.float32).copy()
+                self.it_z_blocks.setdefault(name, []).append(blk)
+
+        # Full state trajectories (optional)
+        if store_full_state and (z is not None) and (q is not None) and (u is not None):
+            dt = np.float16 if str(state_dtype).lower() == "float16" else np.float32
+            self.it_z.append(np.asarray(z, dtype=dt).copy())
+            self.it_q.append(np.asarray(q, dtype=dt).copy())
+            self.it_u.append(np.asarray(u, dtype=dt).copy())
+
+    def finalize(self, *, sol: Any, diag: Any) -> None:
+        try:
+            self.final_next_pos = np.asarray(getattr(sol, "next_pos", None), dtype=np.float32) if getattr(sol, "next_pos", None) is not None else None
+            self.final_z = np.asarray(getattr(sol, "z", None), dtype=np.float32) if getattr(sol, "z", None) is not None else None
+            self.final_q = np.asarray(getattr(sol, "q", None), dtype=np.float32) if getattr(sol, "q", None) is not None else None
+            self.final_u = np.asarray(getattr(sol, "u", None), dtype=np.float32) if getattr(sol, "u", None) is not None else None
+        except Exception:
+            pass
+        # diagnostics (jsonable)
+        try:
+            self.final_diag = _to_py(diag)
+        except Exception:
+            self.final_diag = {}
+
+    def save(self, out_dir: str, *, cfg: CadmmLogConfig) -> None:
+        outp = Path(out_dir)
+        outp.mkdir(parents=True, exist_ok=True)
+
+        meta = {
+            "run_id": self.run_id,
+            "rollout_step": self.rollout_step,
+            "mode": self.mode,
+            "timestamp": self.timestamp,
+            "sizes": {"N": self.N, "E": self.E, "G": self.G, "K": self.K, "T_horizon": self.T_horizon, "coord_dim": self.coord_dim},
+            "block_order": list(self.block_order),
+            "block_slices": {k: [int(v[0]), int(v[1])] for k, v in self.block_slices.items()},
+            "flags": self.flags,
+            "params": self.params,
+            "window": self.window,
+        }
+        (outp / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+
+        # Pack arrays
+        arrays: Dict[str, Any] = {}
+        arrays["k"] = np.asarray(self.it_k, dtype=np.int32)
+        arrays["eta"] = np.asarray(self.it_eta, dtype=np.float32)
+        arrays["r_stop"] = np.asarray(self.it_r_stop, dtype=np.float32)
+        arrays["s_stop"] = np.asarray(self.it_s_stop, dtype=np.float32)
+        arrays["eps_pri"] = np.asarray(self.it_eps_pri, dtype=np.float32)
+        arrays["eps_dual"] = np.asarray(self.it_eps_dual, dtype=np.float32)
+
+        if self.it_r_by_block:
+            arrays["r_by_block"] = np.stack(self.it_r_by_block, axis=0)
+        if self.it_s_by_block:
+            arrays["s_by_block"] = np.stack(self.it_s_by_block, axis=0)
+        if self.it_proj_vio:
+            arrays["proj_vio"] = np.stack(self.it_proj_vio, axis=0)
+
+        # masks
+        if self.it_active_mask:
+            arrays["active_mask"] = np.stack(self.it_active_mask, axis=0)
+        if self.it_u_mask:
+            arrays["u_mask"] = np.stack(self.it_u_mask, axis=0)
+
+        # coupled summaries as jsonl (more robust than np object arrays)
+        with (outp / "coupled.jsonl").open("w", encoding="utf-8") as f:
+            for row in self.it_coupled:
+                f.write(json.dumps(_to_py(row), ensure_ascii=False) + "\n")
+
+        # selected blocks
+        for name, lst in self.it_z_blocks.items():
+            if lst:
+                arrays[f"zblk_{name}"] = np.stack(lst, axis=0)
+
+        # init/final states (optional)
+        if self.z0 is not None: arrays["z0"] = np.asarray(self.z0, dtype=np.float32)
+        if self.q0 is not None: arrays["q0"] = np.asarray(self.q0, dtype=np.float32)
+        if self.u0 is not None: arrays["u0"] = np.asarray(self.u0, dtype=np.float32)
+        if self.final_next_pos is not None: arrays["final_next_pos"] = np.asarray(self.final_next_pos, dtype=np.float32)
+        if self.final_z is not None: arrays["final_z"] = np.asarray(self.final_z, dtype=np.float32)
+
+        if cfg.level == "full":
+            # store full trajectories if present
+            if self.it_z: arrays["z_traj"] = np.stack(self.it_z, axis=0)
+            if self.it_q: arrays["q_traj"] = np.stack(self.it_q, axis=0)
+            if self.it_u: arrays["u_traj"] = np.stack(self.it_u, axis=0)
+
+        npz_path = outp / "arrays.npz"
+        if cfg.save_compressed:
+            np.savez_compressed(npz_path, **arrays)
+        else:
+            np.savez(npz_path, **arrays)
+
+        # final diag
+        (outp / "final_diag.json").write_text(json.dumps(self.final_diag, indent=2, ensure_ascii=False))
+
+@dataclass
+class CadmmLog:
+    """Rollout-level logger for inner C-ADMM.
+
+    Typical usage:
+        log = CadmmLog()
+        problem.log = log
+        sol, ws, diag = solve_inner_cadmm(problem)
+        ...
+        log.save("out_dir")
+    """
+    config: CadmmLogConfig = field(default_factory=CadmmLogConfig)
+    runs: List[CadmmRunLog] = field(default_factory=list)
+
+    def start_run(self, *, problem: Any, reg: Any, z0: np.ndarray, q0: np.ndarray, u0: np.ndarray) -> CadmmRunLog:
+        rid = len(self.runs)
+        mode = "theory" if bool(getattr(getattr(problem, "flags", None), "enable_theory_mode", False)) else "legacy"
+        step = int(getattr(problem, "rollout_step", getattr(problem, "step", -1)))
+        if step < 0:
+            # fallback: window start step
+            try:
+                step = int(getattr(getattr(problem, "window", None), "start_step", -1))
+            except Exception:
+                step = -1
+
+        run = CadmmRunLog(
+            run_id=rid,
+            rollout_step=step,
+            mode=mode,
+            timestamp=float(time.time()),
+            N=int(getattr(problem, "N", 0)),
+            E=int(getattr(problem, "E", 0)),
+            G=int(getattr(problem, "G", 0)),
+            K=int(getattr(problem, "K", getattr(problem, "T", 0)) or 0),
+            T_horizon=int(getattr(problem, "T_horizon", 1) or 1),
+            coord_dim=int(getattr(problem, "coord_dim", 0) or 0),
+        )
+        # registry meta
+        try:
+            run.block_order = list(reg.names())
+            for name in run.block_order:
+                sl = reg.sl(name)
+                run.block_slices[name] = (int(sl.start), int(sl.stop))
+        except Exception:
+            pass
+
+        # flags/params/window (jsonable subset)
+        try:
+            run.flags = _to_py(getattr(problem, "flags", {}))
+        except Exception:
+            run.flags = {}
+        try:
+            run.params = _to_py(getattr(problem, "params", {}))
+        except Exception:
+            run.params = {}
+        try:
+            w = getattr(problem, "window", None)
+            run.window = _to_py({
+                "W": getattr(w, "W", None),
+                "start_step": getattr(w, "start_step", None),
+                "omega_seed": getattr(w, "omega_seed", None),
+            })
+        except Exception:
+            run.window = {}
+
+        run.z0 = np.asarray(z0, dtype=np.float32).copy()
+        run.q0 = np.asarray(q0, dtype=np.float32).copy()
+        run.u0 = np.asarray(u0, dtype=np.float32).copy()
+
+        self.runs.append(run)
+        return run
+
+    def save(self, out_dir: str) -> None:
+        outp = Path(out_dir)
+        outp.mkdir(parents=True, exist_ok=True)
+        idx = {
+            "version": 1,
+            "created": float(time.time()),
+            "config": _to_py(self.config),
+            "num_runs": len(self.runs),
+        }
+        (outp / "index.json").write_text(json.dumps(idx, indent=2, ensure_ascii=False))
+        runs_dir = outp / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        for run in self.runs:
+            run_dir = runs_dir / f"run_{run.run_id:04d}"
+            run.save(str(run_dir), cfg=self.config)
+

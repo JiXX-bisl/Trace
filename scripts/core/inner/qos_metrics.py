@@ -15,8 +15,34 @@ you should only need to replace ``edge_quality_weights`` and/or
 from __future__ import annotations
 
 import numpy as np
-from scripts.utils.hops import compute_comm_state_minhop_minlen
+from typing import Tuple
+from scripts.core.data import CommWindowState, FeatureFlags
 
+def _orient_edge(i: int, j: int, root: int, mode: str) -> Tuple[int, int]:
+    m = str(mode or "min_id")
+    if m == "as_is":
+        return int(i), int(j)
+    if m == "root":
+        if i == root and j != root:
+            return int(i), int(j)
+        if j == root and i != root:
+            return int(j), int(i)
+        a = int(min(i, j)); b = int(max(i, j))
+        return a, b
+    a = int(min(i, j)); b = int(max(i, j))
+    return a, b
+
+
+def _edge_key(i: int, j: int, window_state: CommWindowState, flags: FeatureFlags) -> Tuple[int, int]:
+    # When we orient+dedup edges, cache keys must be directed (src,dst) to match edges order.
+    orient = bool(getattr(flags, "assembled_orient_undirected_edges", False))
+    if not orient:
+        return (i, j) if i <= j else (j, i)
+    # root id: prefer reachability root if available (set by staleness engine), else assembled_root_id
+    root = int(getattr(window_state, "reachability_root_id", getattr(flags, "assembled_root_id", 0)))
+    mode = str(getattr(flags, "assembled_edge_orientation_mode", "min_id"))
+    src, dst = _orient_edge(int(i), int(j), root=root, mode=mode)
+    return (src, dst)
 
 def incident_edge_indices(edges: np.ndarray, rid: int) -> np.ndarray:
     """
@@ -282,7 +308,6 @@ def connectivity_score_capacity(
             v = 1.0
         sum_cost += v
         denom += 1
-
     return qos_w * float(sum_cost / max(denom, 1))
 
 
@@ -408,9 +433,6 @@ def update_budget_cache(
     except Exception:
         return
 
-    def _edge_key(i: int, j: int) -> tuple[int, int]:
-        return (i, j) if i <= j else (j, i)
-
     edges = np.asarray(getattr(getattr(window_state, "frozen_link", None), "edges", np.zeros((0, 2), np.int32)), dtype=np.int32).reshape(-1, 2)
     E = int(edges.shape[0])
     if usage.size != E:
@@ -426,7 +448,7 @@ def update_budget_cache(
     cache_vals = np.zeros((E,), dtype=np.float32)
 
     for k, (i, j) in enumerate(edges):
-        key = _edge_key(int(i), int(j))
+        key = _edge_key(int(i), int(j), window_state, flags)
         prev = float(cache_obj.get(key, 0.0))
         cur = float(usage[k])
         newv = cur if (not enable_update or a == 0.0) else (a * prev + (1.0 - a) * cur)

@@ -30,6 +30,32 @@ def _edges(problem: Any) -> np.ndarray:
     edges = getattr(link, "edges", np.zeros((0, 2), dtype=np.int32))
     return np.asarray(edges, dtype=np.int32).reshape(-1, 2)
 
+def _orient_edge(u: int, v: int, root: int, mode: str) -> tuple[int, int]:
+    """Deterministically orient an undirected edge {u,v} -> (src,dst).
+
+    This is an *ownership/orientation convention* only. It does NOT change the
+    stored edge list length E, so it is safe for backward compatibility.
+
+    mode:
+      - "as_is"  : keep (u,v)
+      - "min_id" : orient from min(u,v) to max(u,v)  (deterministic)
+      - "root"   : if one endpoint is root, orient root -> other, else fallback to min_id
+    """
+    m = str(mode or "as_is")
+    if m == "as_is":
+        return int(u), int(v)
+    if m == "root":
+        if u == root and v != root:
+            return int(u), int(v)
+        if v == root and u != root:
+            return int(v), int(u)
+        # fallback
+        a = int(min(u, v)); b = int(max(u, v))
+        return a, b
+    # default: min_id
+    a = int(min(u, v)); b = int(max(u, v))
+    return a, b
+
 
 def _root_id(problem: Any, flags: Any) -> int:
     # Prefer reachability root if provided; else allow explicit assembled_root_id;
@@ -66,7 +92,7 @@ def owner_mask_for_block(block_name: str, problem: Any, reg: Any, flags: Any) ->
     mode = str(getattr(flags, "assembled_owner_mode", "all"))
     if mode == "all":
         return m
-
+    
     if mode == "pos_only":
         if block_name != "pos":
             return m
@@ -79,6 +105,26 @@ def owner_mask_for_block(block_name: str, problem: Any, reg: Any, flags: Any) ->
             b = a + coord_dim
             if b <= dim:
                 m[i, a:b] = True
+        return m
+    
+    # ------------------------------------------------------------------
+    # M_red support (Table 5.1):
+    #   C row-block uses "sum-to" elimination basis to avoid dual drift.
+    # Engineering proxy: drop one redundant "all-sum" direction by excluding
+    # the root node from owning this block (N-1 basis).
+    #
+    # Enabled only when requested; default behavior remains unchanged.
+    # ------------------------------------------------------------------
+    elim_sum_to = bool(getattr(flags, "assembled_eliminate_sum_to_basis", False))
+    if elim_sum_to and block_name in ("B_hat",):
+        # If B_hat is present, make an (N-1) ownership basis by removing root.
+        # This matches "全和等式消元取基" rationale in Table 5.1.
+        root = _root_id(problem, flags)
+        if 0 <= root < N and N >= 2:
+            m[:] = True
+            m[root, :] = False
+            return m
+        # degenerate: keep default
         return m
 
     if mode in ("edge_by_src", "edge_by_incident"):
@@ -98,9 +144,22 @@ def owner_mask_for_block(block_name: str, problem: Any, reg: Any, flags: Any) ->
 
         m[:] = False
         per_edge_dim = int(dim // E) if E > 0 else 0
+
+        # Table 5.1 requires undirected-edge orientation / de-dup convention.
+        # Here we only enforce the *orientation convention* used for ownership.
+        # Real de-dup of E should be done upstream (window/staleness) when you
+        # construct E_t^->. This keeps backward compatibility.
+        orient_undirected = bool(getattr(flags, "assembled_orient_undirected_edges", False)) or bool(
+            getattr(flags, "enable_theory_mode", False)
+        )
+        orient_mode = str(getattr(flags, "assembled_edge_orientation_mode", "as_is"))
+        root = _root_id(problem, flags) if orient_undirected else 0
+
         for e in range(E):
             u = int(edges[e, 0])
             v = int(edges[e, 1])
+            if orient_undirected:
+                u, v = _orient_edge(u, v, root=root, mode=orient_mode)            
             a = e * per_edge_dim
             b = a + per_edge_dim
             if b > dim:

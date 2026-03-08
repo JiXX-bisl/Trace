@@ -8,9 +8,34 @@ import numpy as np
 from scripts.core.data import CommWindowState, LinkSnapshot, CadmmParams, FeatureFlags
 
 
-def _edge_key(i: int, j: int) -> Tuple[int, int]:
-    return (i, j) if i <= j else (j, i)
+# def _edge_key(i: int, j: int) -> Tuple[int, int]:
+#     return (i, j) if i <= j else (j, i)
 
+def _orient_edge(i: int, j: int, root: int, mode: str) -> Tuple[int, int]:
+    m = str(mode or "min_id")
+    if m == "as_is":
+        return int(i), int(j)
+    if m == "root":
+        if i == root and j != root:
+            return int(i), int(j)
+        if j == root and i != root:
+            return int(j), int(i)
+        a = int(min(i, j)); b = int(max(i, j))
+        return a, b
+    a = int(min(i, j)); b = int(max(i, j))
+    return a, b
+
+
+def _edge_key(i: int, j: int, window_state: CommWindowState, flags: FeatureFlags) -> Tuple[int, int]:
+    # When we orient+dedup edges, cache keys must be directed (src,dst) to match edges order.
+    orient = bool(getattr(flags, "assembled_orient_undirected_edges", False))
+    if not orient:
+        return (i, j) if i <= j else (j, i)
+    # root id: prefer reachability root if available (set by staleness engine), else assembled_root_id
+    root = int(getattr(window_state, "reachability_root_id", getattr(flags, "assembled_root_id", 0)))
+    mode = str(getattr(flags, "assembled_edge_orientation_mode", "min_id"))
+    src, dst = _orient_edge(int(i), int(j), root=root, mode=mode)
+    return (src, dst)
 
 def stage0_init_if_needed(
     step: int,
@@ -51,7 +76,8 @@ def stage0_init_if_needed(
     edges = np.asarray(link_frozen.edges, dtype=np.int32).reshape(-1, 2)
     budget_cache: Dict[Tuple[int, int], float] = {}
     for (i, j) in edges:
-        budget_cache[_edge_key(int(i), int(j))] = 0.0
+        # budget_cache[_edge_key(int(i), int(j))] = 0.0
+        budget_cache[_edge_key(int(i), int(j), window_state, flags)] = 0.0
     # setattr(window_state, "budget_cache", budget_cache)
     window_state.budget_cache = budget_cache
     setattr(window_state, "stage0_inited_step", int(step))

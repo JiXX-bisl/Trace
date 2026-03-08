@@ -42,7 +42,7 @@ independently by flattening -> projecting -> reshaping back.
 from __future__ import annotations
 
 from dataclasses import is_dataclass, fields
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -346,6 +346,194 @@ def viol_polytope(
         hi_v = _as1d(hi).astype(np.float32) if hi is not None else np.full((x.size,), np.inf, np.float32)
         maxv = max(maxv, viol_box(x, lo_v, hi_v))
     return float(maxv)
+
+
+# ---------------------------------------------------------------------------
+# Joint (y_hat, sigma) projection for theory mode
+# ---------------------------------------------------------------------------
+
+def proj_y_sigma_polytope(
+    y: np.ndarray,
+    sigma: np.ndarray,
+    sigma_max: Union[float, np.ndarray],
+    *,
+    method: str = "dykstra",
+    iters: int = 200,
+    tol: float = 1e-6,
+    return_info: bool = False,
+) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, Dict[str, Any]]]:
+    """Project (y, sigma) jointly onto the theory coupling polytope.
+
+    Supports y with shape (G*T,) or (G,) (T inferred automatically).
+    Packing convention for y when flat:
+      y_flat[g*T + t] == y_gt[g, t] where y_gt has shape (G, T) (C-order).
+    Constraints (per group g):
+      - 0 <= y_{g,t} <= 1
+      - 0 <= sigma_g <= sigma_max
+      - y_{g,t} - sigma_g <= 0            (y <= sigma)
+      - sigma_g - sum_t y_{g,t} <= 0      (sigma <= sum_t y)
+
+    Euclidean projection onto intersection of a box and two families of halfspaces.
+    Implemented via sparse Dykstra / serial cyclic projections (no external QP).
+
+    Usage
+    y_new, sigma_new, info = proj_y_sigma_polytope(
+        y_hat, sigma, sigma_max,
+        method="dykstra", iters=200, tol=1e-6, return_info=True
+    )
+    """
+    y_in = np.asarray(y)
+    s_in = np.asarray(sigma)
+    y_flat = _as1d(y_in).astype(np.float32, copy=False)
+    s_flat = _as1d(s_in).astype(np.float32, copy=False)
+
+    G = int(s_flat.size)
+    if G <= 0:
+        raise ValueError("proj_y_sigma_polytope requires sigma with positive length")
+
+    # infer T
+    if y_flat.size == G:
+        T = 1
+    elif (y_flat.size % G) == 0:
+        T = int(y_flat.size // G)
+    else:
+        raise ValueError(f"proj_y_sigma_polytope: cannot infer T from y.size={y_flat.size} and G={G}")
+
+    # broadcast sigma_max
+    if np.isscalar(sigma_max):
+        smax = np.full((G,), float(sigma_max), dtype=np.float32)
+    else:
+        smax = _as1d(np.asarray(sigma_max)).astype(np.float32, copy=False)
+        if smax.size == 1:
+            smax = np.full((G,), float(smax[0]), dtype=np.float32)
+        if smax.size != G:
+            raise ValueError(f"sigma_max dim mismatch: expected {G}, got {smax.size}")
+
+    y_dim = int(y_flat.size)
+    v = np.concatenate([y_flat, s_flat], axis=0).astype(np.float32, copy=False)
+
+    lo = np.concatenate([np.zeros((y_dim,), np.float32), np.zeros((G,), np.float32)], axis=0)
+    hi = np.concatenate([np.ones((y_dim,), np.float32), smax], axis=0)
+
+    def _max_violation(x: np.ndarray) -> float:
+        maxv = float(viol_box(x, lo, hi))
+        yy = x[:y_dim].reshape((G, T))
+        ss = x[y_dim:]
+        v1 = float(np.max(yy - ss[:, None])) if yy.size else 0.0                # y - sigma
+        v2 = float(np.max(ss - np.sum(yy, axis=1))) if ss.size else 0.0         # sigma - sum(y)
+        return float(max(maxv, v1, v2, 0.0))
+
+    pre_maxv = _max_violation(v)
+    method_l = str(method).lower()
+    if method_l not in ("dykstra", "serial"):
+        raise ValueError(f"Unknown method for proj_y_sigma_polytope: {method}")
+
+    x = v.copy()
+    used = 0
+
+    # Dykstra correction terms (sparse)
+    p_box = np.zeros_like(x)
+    pA_y = np.zeros((G, T), dtype=np.float32)   # for y_{g,t} - sigma_g <= 0
+    pA_s = np.zeros((G, T), dtype=np.float32)
+    pB_y = np.zeros((G, T), dtype=np.float32)   # for sigma_g - sum_t y_{g,t} <= 0
+    pB_s = np.zeros((G,), dtype=np.float32)
+
+    for k in range(int(iters)):
+        x_old = x.copy()
+
+        # 1) box
+        if method_l == "dykstra":
+            ytmp = x + p_box
+            x_new = proj_box(ytmp, lo, hi)
+            p_box = ytmp - x_new
+            x = x_new
+        else:
+            x = proj_box(x, lo, hi)
+
+        # 2) y_{g,t} - sigma_g <= 0  (a=[1,-1], ||a||^2=2)
+        yy = x[:y_dim].reshape((G, T))
+        ss = x[y_dim:]
+        for g in range(G):
+            for t in range(T):
+                if method_l == "dykstra":
+                    yval = float(yy[g, t] + pA_y[g, t])
+                    sval = float(ss[g] + pA_s[g, t])
+                else:
+                    yval = float(yy[g, t])
+                    sval = float(ss[g])
+
+                r = yval - sval
+                if r > 0.0:
+                    yproj = yval - 0.5 * r
+                    sproj = sval + 0.5 * r
+                else:
+                    yproj = yval
+                    sproj = sval
+
+                if method_l == "dykstra":
+                    pA_y[g, t] = yval - yproj
+                    pA_s[g, t] = sval - sproj
+
+                yy[g, t] = yproj
+                ss[g] = sproj
+
+        x[:y_dim] = yy.reshape(-1)
+        x[y_dim:] = ss
+
+        # 3) sigma_g - sum_t y_{g,t} <= 0  (a=[-1...-1,1], ||a||^2=T+1)
+        yy = x[:y_dim].reshape((G, T))
+        ss = x[y_dim:]
+        denom = float(T + 1)
+        for g in range(G):
+            if method_l == "dykstra":
+                yvec = yy[g, :] + pB_y[g, :]
+                sval = float(ss[g] + pB_s[g])
+            else:
+                yvec = yy[g, :]
+                sval = float(ss[g])
+
+            r = sval - float(np.sum(yvec))
+            if r > 0.0:
+                step = r / denom
+                yproj = yvec + step
+                sproj = sval - step
+            else:
+                yproj = yvec
+                sproj = sval
+
+            if method_l == "dykstra":
+                pB_y[g, :] = yvec - yproj
+                pB_s[g] = sval - sproj
+
+            yy[g, :] = yproj
+            ss[g] = sproj
+
+        x[:y_dim] = yy.reshape(-1)
+        x[y_dim:] = ss
+
+        used = k + 1
+        maxv = _max_violation(x)
+        delta = float(np.linalg.norm(x - x_old, ord=2))
+        if maxv <= float(tol) and delta <= float(tol):
+            break
+
+    y_out = x[:y_dim].reshape(y_in.shape).astype(y_in.dtype, copy=False)
+    s_out = x[y_dim:].reshape(s_in.shape).astype(s_in.dtype, copy=False)
+
+    if not return_info:
+        return y_out, s_out
+
+    dx = x - v
+    info: Dict[str, Any] = {
+        "iters_used": int(used),
+        "pre_max_violation": float(pre_maxv),
+        "post_max_violation": float(_max_violation(x)),
+        "corr_norm": float(np.linalg.norm(dx, ord=2)) if dx.size else 0.0,
+        "corr_inf": float(np.max(np.abs(dx))) if dx.size else 0.0,
+        "G": int(G),
+        "T": int(T),
+    }
+    return y_out, s_out, info
 
 # ---------------------------------------------------------------------------
 # Constraint object dispatch (from dataclasses) + lightweight tuple support

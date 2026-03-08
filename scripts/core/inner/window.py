@@ -1,7 +1,7 @@
 # scripts/core/inner/window.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple, List
 import numpy as np
 
 from scripts.core.data import LinkSnapshot, CommWindowState, FeatureFlags
@@ -11,6 +11,91 @@ from scripts.core.inner.staleness import (
     compute_active_hint,
     attach_staleness_to_window
 )
+
+def _should_orient_dedup(flags: FeatureFlags) -> bool:
+    # Use the same switch you already introduced for M_red / ownership alignment.
+    return bool(getattr(flags, "assembled_orient_undirected_edges", False))
+
+
+def _root_id_from_flags(flags: FeatureFlags) -> int:
+    # Keep consistent with assembled_ops.py's root selection order (best-effort).
+    try:
+        return int(getattr(flags, "assembled_root_id", 0))
+    except Exception:
+        return 0
+
+
+def _orient_edge(u: int, v: int, root: int, mode: str) -> Tuple[int, int]:
+    m = str(mode or "min_id")
+    if m == "as_is":
+        return int(u), int(v)
+    if m == "root":
+        if u == root and v != root:
+            return int(u), int(v)
+        if v == root and u != root:
+            return int(v), int(u)
+        a = int(min(u, v)); b = int(max(u, v))
+        return a, b
+    # default: min_id
+    a = int(min(u, v)); b = int(max(u, v))
+    return a, b
+
+
+def _orient_and_dedup_link(link: LinkSnapshot, flags: FeatureFlags) -> LinkSnapshot:
+    """Orient undirected edges deterministically and remove duplicates.
+
+    Output edges are directed keys (src,dst) and arrays are kept aligned.
+    Only active when _should_orient_dedup(flags) is True.
+    """
+    if not _should_orient_dedup(flags):
+        return link
+
+    edges = np.asarray(link.edges, dtype=np.int32).reshape(-1, 2)
+    E = int(edges.shape[0])
+    if E <= 0:
+        return link
+
+    root = _root_id_from_flags(flags)
+    mode = str(getattr(flags, "assembled_edge_orientation_mode", "min_id"))
+
+    keep_idx: List[int] = []
+    new_edges: List[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    for e in range(E):
+        u = int(edges[e, 0]); v = int(edges[e, 1])
+        src, dst = _orient_edge(u, v, root=root, mode=mode)
+        key = (src, dst)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep_idx.append(e)
+        new_edges.append(key)
+
+    keep = np.asarray(keep_idx, dtype=np.int64)
+    edges2 = np.asarray(new_edges, dtype=np.int32).reshape(-1, 2)
+
+    def _pick(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x)
+        if x.ndim == 0:
+            return x
+        x = x.reshape(-1)
+        if x.size == E:
+            return x[keep].copy()
+        # fallback: mismatch size, pass through
+        return x.copy()
+
+    return LinkSnapshot(
+        robot_ids=list(link.robot_ids),
+        edges=edges2.copy(),
+        signal=_pick(link.signal),
+        capacity=_pick(link.capacity),
+        delay=_pick(link.delay),
+        plr=_pick(link.plr),
+        is_stale=_pick(link.is_stale).astype(bool, copy=False),
+    )
+
+ 
+
 
 
 def _clone_link(link: LinkSnapshot) -> LinkSnapshot:
@@ -46,11 +131,16 @@ def open_or_update_window(
 
     if window_state is None:
         omega_seed = int(rng.integers(0, 2**31 - 1))
-        return CommWindowState(W=W, start_step=step, omega_seed=omega_seed, frozen_link=_clone_link(link_current))
-
+        # return CommWindowState(W=W, start_step=step, omega_seed=omega_seed, frozen_link=_clone_link(link_current))
+        link_used = _orient_and_dedup_link(link_current, flags)
+        return CommWindowState(W=W, start_step=step, omega_seed=omega_seed, frozen_link=_clone_link(link_used))
+    
     if step >= window_state.start_step + window_state.W:
         omega_seed = int(rng.integers(0, 2**31 - 1))
-        return CommWindowState(W=W, start_step=step, omega_seed=omega_seed, frozen_link=_clone_link(link_current))
+        # return CommWindowState(W=W, start_step=step, omega_seed=omega_seed, frozen_link=_clone_link(link_current))
+        link_used = _orient_and_dedup_link(link_current, flags)
+        return CommWindowState(W=W, start_step=step, omega_seed=omega_seed, frozen_link=_clone_link(link_used))
+
 
     return window_state
 
@@ -70,8 +160,10 @@ def select_window_link(
     if bool(getattr(flags, "enable_link_freeze", False)):
         if window_state is None:
             raise ValueError("enable_link_freeze=True but window_state is None")
-        return window_state.frozen_link
-    return link_current
+        # return window_state.frozen_link
+    # return link_current
+        return _orient_and_dedup_link(window_state.frozen_link, flags)
+    return _orient_and_dedup_link(link_current, flags)
 
 
 def apply_ttl_filter(
@@ -101,13 +193,13 @@ def apply_ttl_filter(
     if enable_engine:
         if step is None or window_state is None or N is None:
             raise ValueError("enable_stalness_engine = True requires step/window_state/N")
-        update_last_seen(int(step), link_current=link, window_state=window_state)
+        update_last_seen(int(step), link_current=link, window_state=window_state, flags=flags)
     
         use_freeze = bool(getattr(flags, "enable_link_freeze", False))
         link_used = window_state.frozen_link if (use_freeze and window_state is not None) else link
 
         strict = bool(getattr(window_state, "staleness_strict", False))
-        is_stale = compute_is_stale(int(step), link_used, window_state, int(ttl_steps), strict=strict)
+        is_stale = compute_is_stale(int(step), link_used, window_state, flags, int(ttl_steps), strict=strict)
         active_hint = compute_active_hint(
             int(N),
             link_used,

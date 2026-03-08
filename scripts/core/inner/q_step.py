@@ -29,6 +29,7 @@ from scripts.core.inner.blocks import BlockRegistry, decode_pos, set_block, get_
 import scripts.core.inner.coverage_metrics as coverage_metrics
 import scripts.core.inner.qos_metrics as qos_metrics
 from scripts.utils.hops import capacity_for_rid_candidates_minlen_src
+from scripts.core.inner.projections import proj_simplex
 
 # ---------------------------------------------------------------------------
 # Cost terms (Stage A)
@@ -118,10 +119,10 @@ def cost_admm_quadratic(cand: np.ndarray, target: np.ndarray, eta: float) -> flo
     return 0.5 * float(eta) * float(np.dot(d, d))
 
 
-def cost_move(cand: np.ndarray, current_pos: np.ndarray, move_w: float) -> float:
+def cost_move(cand: np.ndarray, current_pos: np.ndarray, move_w: float, r_i:float) -> float:
     """move_w * ||cand - current_pos||^2."""
     d = cand - current_pos
-    return float(move_w) * float(np.dot(d, d))
+    return float(move_w) * (float(np.dot(d, d)) / (r_i + 1e-12) ** 2)
 
 
 # def cost_explore_from_frontier_entropy(
@@ -202,8 +203,45 @@ def cost_explore_from_grid_gain(
     g = float(gg[iz, iy, ix])
     if not np.isfinite(g):
         g = 0.0
-    return -float(new_w) * g
+    return float(new_w) * (1.0 - g)
 
+def cost_overlap(
+    cand: np.ndarray,
+    *,
+    rid: int,
+    robot_pos: np.ndarray,
+    sense_radius: float=5.0,
+    ov_w: float = 0.4
+): 
+    """UGV overlap penalty based on sensing coverage overlap (nearest-teammate)."""
+    if ov_w <= 0.0:
+        return 0.0
+    pos = np.asarray(robot_pos, dtype=np.float32)
+    if pos.ndim != 2 or pos.shape[0] <= 1:
+        return 0.0
+
+    c = np.asarray(cand, dtype=np.float32).reshape(-1)
+    if c.size == 2 and pos.shape[1] == 3:
+        c = np.array([c[0], c[1], 0.0], dtype=np.float32)
+    else:
+        c = c[:pos.shape[1]]
+
+    # distances to others
+    d = np.linalg.norm(pos - c[None, :], axis=1)
+    d[int(rid)] = np.inf
+    d_min = float(np.min(d))
+    if not np.isfinite(d_min):
+        return 0.0
+
+    R = float(sense_radius)
+    # overlap starts when d < 2R
+    t = 1.0 - d_min / max(2.0 * R, 1e-6)
+    if t <= 0.0:
+        return 0.0
+    phi = float(t * t)  # in (0,1]
+    if phi > 1.0:
+        phi = 1.0
+    return float(ov_w) * phi
 
 def cost_task_distance(
     cand: np.ndarray,
@@ -256,7 +294,7 @@ def cost_task_direction(
       - optional priority normalization to keep magnitude stable
     Returns in [0, urgency_w] (approximately).
     """
-    tp = np.ndarray(task_pos, dtype=np.float32)
+    tp = np.asarray(task_pos, dtype=np.float32)
     if tp.ndim != 2 or tp.shape[0] == 0: return 0.0
 
     cand = np.asarray(cand, dtype=np.float32).reshape(-1)
@@ -511,6 +549,55 @@ def cost_clearance(
     psi = float(np.max(psi_all))
     return float(clr_w) * psi
 
+# ==== frontier_distacne cost ====
+def frontier_min_dist_for_candidates(
+    candidates_xyz: np.ndarray,      # (M,3)
+    frontier_xyz: np.ndarray,        # (F,3)
+    *,
+    chunk: int = 256,
+) -> np.ndarray:
+    """
+    Return d_min: (M,) where d_min[i] = min_j ||cand_i - frontier_j||.
+    Vectorized with chunking to control memory.
+
+    Complexity: O(M*F) but fast in numpy for moderate sizes.
+    """
+    cand = np.asarray(candidates_xyz, dtype=np.float32)
+    front = np.asarray(frontier_xyz, dtype=np.float32)
+
+    M = int(cand.shape[0])
+    if M == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if front.ndim != 2 or front.shape[0] == 0:
+        # no frontier -> no guidance; return large constant distances
+        return np.full((M,), 1e9, dtype=np.float32)
+
+    dmin = np.full((M,), np.inf, dtype=np.float32)
+
+    # chunk over candidates: (B,F,3) temporary
+    for s in range(0, M, int(chunk)):
+        e = min(M, s + int(chunk))
+        c = cand[s:e]  # (B,3)
+        # compute squared distances to all frontier points
+        diff = c[:, None, :] - front[None, :, :]          # (B,F,3)
+        dist2 = np.sum(diff * diff, axis=2)               # (B,F)
+        dmin[s:e] = np.sqrt(np.min(dist2, axis=1)).astype(np.float32)
+
+    return dmin
+
+def frontier_distance_costs(
+    candidates_xyz: np.ndarray,   # (M,3)
+    frontier_xyz: np.ndarray,     # (F,3)
+    *,
+    w_front: float = 1.0,
+    d_scale: float = 25.0,
+    chunk: int = 256,
+) -> np.ndarray:
+    dmin = frontier_min_dist_for_candidates(candidates_xyz, frontier_xyz, chunk=chunk)  # (M,)
+    d_scale = float(max(d_scale, 1e-6))
+    cost = np.clip(dmin / d_scale, 0.0, 1.0).astype(np.float32)
+    return (float(w_front) * cost).astype(np.float32)
+
 
 def pos_candidate_score(
     *,
@@ -527,20 +614,30 @@ def pos_candidate_score(
     """Composable total cost for selecting a position candidate (Stage A)."""
     flags = getattr(problem, "flags", None)
     params = getattr(problem, "params", None)
-
+    debug_print_flag = False
     total = 0.0
-
+    info = {}
+    if debug_print_flag: print("=========")
     # ADMM quadratic term (default ON)
     if bool(getattr(flags, "enable_qstep_admm_term", True)):
         # print(f"ADMM cost: {cost_admm_quadratic(cand, target, eta)}")
+        # sys.exit()
         total += cost_admm_quadratic(cand, target, eta)
 
     # move
     if bool(getattr(flags, "enable_qstep_cost_move", False)):
         move_w = float(getattr(params, "move_w", 0.0))
-        move_cost = cost_move(cand, current_pos, move_w)
-        # print(f"Move cost: {move_cost}")
+        r_i = 1.0 if problem.robots[rid].rtype == "ugv" else 2.0
+        move_cost = cost_move(cand, current_pos, move_w, r_i)
+        if debug_print_flag: print(f"Move cost: {move_cost}")
         total += move_cost
+        ov_w = 0.4
+        sense_r = problem.robots[rid].sense_r
+        overlap_cost = cost_overlap(cand, rid=rid, robot_pos=robot_pos, sense_radius=sense_r, ov_w=ov_w)
+        # total+=overlap_cost
+        info["move_cost"] = move_cost
+        info["overlap_cost"] = overlap_cost
+
 
     # explore
     if bool(getattr(flags, "enable_qstep_cost_explore", False)):
@@ -549,7 +646,10 @@ def pos_candidate_score(
         grid_gain = getattr(problem, "grid_gain", None)
         res = getattr(problem, "resolution", 1.0)
         if grid_gain is not None:
-            total += cost_explore_from_grid_gain(cand, grid_gain=grid_gain, new_w=new_w, resolution=res)
+            explore_cost = cost_explore_from_grid_gain(cand, grid_gain=grid_gain, new_w=new_w, resolution=res)
+            if debug_print_flag: print(f"explore cost: {explore_cost}")
+            total += explore_cost
+            info["explore_cost"] = explore_cost
         else:
             total += cost_explore_from_frontier_entropy(cand, problem.frontier_entropy, new_w)
 
@@ -559,11 +659,13 @@ def pos_candidate_score(
         rho = float(getattr(params, "rho", 0.0))
         obst_cost = cost_clearance(
             cand=cand, 
-            obstacles_lo=problem.obstacles_lo,
-            obstacles_hi=problem.obstacles_hi,
+            obstacles_lo=problem.obstacle_lo,
+            obstacles_hi=problem.obstacle_hi,
             rho=rho,
             clr_w=obst_w
         )
+        info["obst_cost"] = obst_cost
+        if debug_print_flag: print(f"obst cost: {obst_cost}")
         total += obst_cost
 
     # task
@@ -589,7 +691,8 @@ def pos_candidate_score(
                 coord_dim=problem.coord_dim,
                 mode=str(getattr(params, "task_mode", "top1")),  # "top1" or "weighted"
             )
-            # print(f"Task cost: {task_cost}")
+            info["task_cost"] = task_cost
+            if debug_print_flag: print(f"Task cost: {task_cost}")
             total += task_cost
             # sys.exit()
 
@@ -609,6 +712,8 @@ def pos_candidate_score(
                 sigma_rep={"mode": "quad", "d0": 3.0},
                 rep_w=rep_w
             )
+            info["repulsion_cost"] = rep_cost
+            if debug_print_flag: print(f"rep cost: {rep_cost}")
             total += rep_cost  # cost_repulsion(cand, current_pos, rep_grad[rid], rep_w, problem.coord_dim)
     
     # qos connectivity
@@ -629,11 +734,12 @@ def pos_candidate_score(
                     rid=rid, cand_idx=idx, caps_to=caps, c_low=c_low, qos_w=qos_w
                 )
             )
-            # print(f"QoS cost: {qos_cost}")
+            if debug_print_flag: print(f"QoS cost: {qos_cost}")
             total += qos_cost
+            info["qos_cost"] = qos_cost
         except Exception:
             pass
-    return float(total)
+    return float(total), info
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +755,7 @@ def solve_local_q(
     u_i: np.ndarray,
     q_i_prev: np.ndarray,
     rng: np.random.Generator,
+    y_tgt_override: Optional[np.ndarray] = None
 ) -> np.ndarray:
     """Solve local q-step for one robot (Stage A).
 
@@ -683,21 +790,62 @@ def solve_local_q(
 
     # new added at 20260227 by JiXX
     flags = getattr(problem, "flags", None)
+    theory_mode = bool(getattr(flags, "enable_theory_mode", False))
+    # Route-B: theta convexification must be explicitly enabled (default OFF for legacy safety)
+    enable_theta_flag = bool(getattr(flags, "enable_theta", False))
+    # YAVG: strict average-assembly mode (mean(s_hat)-y_hat = 0) gating
+    # Meaning:
+    #   - y_hat becomes a true z-variable (global), NOT a q-local writeback.
+    #   - q-step must output s_hat_i = Phi_i @ theta_i as explicit local contribution.
+    enable_y_avg_assembly = bool(getattr(flags, "enable_y_avg_assembly", False))
+    YAVG = bool(enable_y_avg_assembly) and bool(theory_mode) and bool(enable_theta_flag)
+
+    # Hard configuration checks (fail-fast, avoids silent "half-enabled" states):
+    if enable_y_avg_assembly:
+        if "y_hat" not in reg.names():
+            raise ValueError("enable_y_avg_assembly=True requires y_hat block in registry.")
+        if "s_hat" not in reg.names():
+            raise ValueError("enable_y_avg_assembly=True requires s_hat block in registry.")
+        # Hard constraint (i): must use solver-provided target, never (z-u)_y_hat.
+        if y_tgt_override is None:
+            raise ValueError("enable_y_avg_assembly=True requires y_tgt_override from solver (do NOT use (z-u)_y_hat).")    
+
     # Strict ADMM mode: q-step is proximal for f_i(q) = 0 in scaled form
     # q_i := argmin (eta / 2) || q - z + u_i || ^ 2 => q_i = z - u_i
     strict_prox = bool(getattr(flags, "qstep_strict_prox", False))
-    if strict_prox:
-        q_i_new = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32)).copy()
-        return q_i_new
-    
-    # Default (heuristic) mode: copy z then optionally update blocks
-    q_i_new = np.asarray(z, dtype=np.float32).copy()
+    # if strict_prox:
+    #     q_i_new = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32)).copy()
+    #     return q_i_new
+    z_minus_u = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32))
+    # In theory mode, baseline should be z-u (prox center), then overwrite pos/theta etc.
+    if strict_prox and (not theory_mode):
+        q_i_new = z_minus_u.copy()
+        return q_i_new    
+    # # Default (heuristic) mode: copy z then optionally update blocks
+    # q_i_new = np.asarray(z, dtype=np.float32).copy()
+    # Baseline:
+    #  - legacy: q starts from z (heuristic decision layer)
+    #  - theory mode: q starts from z-u (prox-center) so that ADMM dual/consensus information
+    #    can *actually* influence local decisions (including theta-QP).
+    q_i_new = (z_minus_u.copy() if theory_mode else np.asarray(z, dtype=np.float32).copy())
+
 
     params = getattr(problem, "params", None)
     coord_dim = problem.coord_dim
     # Default best position for downstream updates
     current_pos = np.asarray(problem.robot_pos[rid], dtype=np.float32).reshape(coord_dim)
-    best = current_pos
+    # best = current_pos
+    pos_new = current_pos
+    # Whether Route-B theta-QP branch was used (to avoid overwriting y_hat later by heuristic)
+    used_theta_qp = False
+    # Always define these vars to avoid UnboundLocalError in sigma-update path.
+    # Even if theta-QP was used, sigma step may still query y_hat_final.
+    y_hat_pref: Optional[np.ndarray] = None
+    y_hat_final: Optional[np.ndarray] = None
+
+    # In YAVG mode, q-step must NEVER write q.y_hat (y_hat is a z-variable).
+    # This prevents "mixed dual" / double-update on y_hat (Hard constraint A).
+    disable_q_y_hat = bool(YAVG)
 
     # --- Pos Update ---
     # gate for future: disable pos update without removing pos block
@@ -719,66 +867,500 @@ def solve_local_q(
             except Exception:
                 target_all = decode_pos(reg, np.asarray(z, dtype=np.float32), N, problem.coord_dim)
             target = np.asarray(target_all[rid], dtype=np.float32).reshape(coord_dim)
-            eta = float(getattr(params, "eta", 1.0)) if params is not None else 1.0
+            # # eta = float(getattr(params, "eta", 1.0)) if params is not None else 1.0
+            # # ---------- ROUTE-B: theta convexification ----------
+            # enable_theta = theory_mode and ("theta" in reg.names()) and bool(getattr(flags, "enable_qstep_update_theta", True))
+            # # per-candidate linear costs c_m (exclude ADMM quadratic term)
+            # caps, _hops = capacity_for_rid_candidates_minlen_src(
+            #     rid, candidates, problem.robot_pos,
+            #     params.los_max_dist, problem.is_los_fn, params.C_max
+            # )
 
-            caps, hops = capacity_for_rid_candidates_minlen_src(
-                rid, candidates, problem.robot_pos, problem.los_max_dist, problem.is_los_fn, problem.C_max
+            # ------------------------------------------------------------------
+            # (a) Trigger condition for Route-B theta-QP:
+            #     - theory_mode enabled AND theta enabled AND theta block exists.
+            #     - additionally requires y_hat block, because theta is coupled via Phi*theta -> y_hat.
+            # Meaning: only in this mode we enforce "action convexification + consensus feedback".
+            # ------------------------------------------------------------------
+            enable_theta = (
+                theory_mode
+                and enable_theta_flag
+                and ("theta" in reg.names())
+                and ("y_hat" in reg.names())
+                and bool(getattr(flags, "enable_qstep_update_theta", True))
             )
 
-            best_idx: int = 0
-            best_cost: Optional[float] = None
-            for idx in range(int(candidates.shape[0])):
-                cand = candidates[idx]
-                c = pos_candidate_score(
-                    rid=rid,
-                    cand=cand,
-                    robot_pos=problem.robot_pos,
-                    target=target,
-                    current_pos=current_pos,
-                    problem=problem,
-                    eta=eta,
-                    idx=idx,
-                    caps=caps
-                )
-                if best_cost is None:
-                    best_cost = c
-                    best_idx = idx
+            # per-candidate QoS capacities used by pos_candidate_score (legacy term)
+            los_max_dist = float(getattr(params, "los_max_dist", 15.0)) if params is not None else 15.0
+            C_max = float(getattr(params, "C_max", 30.0)) if params is not None else 30.0
+            caps, _hops = capacity_for_rid_candidates_minlen_src(
+                rid, candidates, problem.robot_pos, los_max_dist, problem.is_los_fn, C_max
+            )
+            fallback_legacy = False
+            if enable_theta:
+                try:
+                    # theta block is stacked: shape (N, M_theta)
+                    # ------------------------------------------------------------------
+                    # (b) Theta-QP objective (convex):
+                    #   min_{theta in simplex}  c^T theta
+                    #     + (eta_y/2)||Phi theta - y_tgt||^2    (consensus/dual feedback through y_hat)
+                    #     + (eta_theta/2)||theta - theta_prev||^2 (stabilizer / warm-start)
+                    #
+                    # y_tgt = (z-u)_{y_hat}  : ADMM prox-center => brings z_eq consensus back to theta.
+                    # theta_prev from q_i_prev: warm-start => prevents oscillation and improves stability.
+                    # ------------------------------------------------------------------
+
+                    # theta block is stacked: shape (N, M_theta) in the *flat* vector                
+
+                    th_shape = reg.shape("theta")
+                    M_theta = int(th_shape[-1]) if len(th_shape) >= 2 else int(np.prod(th_shape))
+                    M_i = int(candidates.shape[0])
+                    M_use = int(min(M_i, M_theta))
+                    if M_use <= 0:
+                        # no valid candidates
+                        pos_new = current_pos
+                    else:
+                        # # theta target from z-u (prox center)
+                        # try:
+                        #     th_all = np.asarray(get_block(reg, z_minus_u, "theta"), dtype=np.float32).reshape(N, M_theta)
+                        #     th_tgt = np.asarray(th_all[rid], dtype=np.float32).reshape(-1)
+                        # except Exception:
+                        #     th_tgt = np.zeros((M_theta,), dtype=np.float32)
+                        #     th_tgt[:M_use] = 1.0 / float(M_use)
+                        # (b.1) Build Phi_y for candidates: Phi has shape (dy, M_use)
+                        # Meaning: each column is phi_m = y_hat feature vector induced by candidate m.
+                        # This is the "action -> y_hat" map required by the theory.
+                        Phi = coverage_metrics.candidate_y_features(
+                            problem, rid, candidates[:M_use], reg, flags
+                        ).astype(np.float32, copy=False)  # (dy, M_use)
+
+                        dy = int(Phi.shape[0])
+                        if dy <= 0:
+                            # If y_hat dim is degenerate, fall back to legacy behavior
+                            enable_theta = False
+                            raise ValueError("degenerate y_hat dim: dy<=0")
+                        else:
+                            # (b.2) ADMM prox-center target for y_hat: y_tgt = (z-u)_{y_hat}
+                            # Meaning: this is where dual/consensus information enters theta-QP.
+                            # y_tgt = np.asarray(get_block(reg, z_minus_u, "y_hat"), dtype=np.float32).reshape(-1)
+                            # (b.2) Target for theta-QP coupling.
+                            # - Legacy/theory (non-YAVG): y_tgt = (z-u)_{y_hat}  (consensus feedback)
+                            # - YAVG: MUST use solver-provided y_tgt_override to avoid mixed dual
+                            #         and to reflect mean(s_hat)-y_hat assembly (Hard constraint A).
+                            if YAVG:
+                                y_tgt = np.asarray(y_tgt_override, dtype=np.float32).reshape(-1)
+                            else:
+                                y_tgt = np.asarray(get_block(reg, z_minus_u, "y_hat"), dtype=np.float32).reshape(-1)
+
+                            if y_tgt.size != dy:
+                                # dimension mismatch => do not risk silent bugs
+                                raise ValueError(f"y_tgt dim {y_tgt.size} != Phi rows dy {dy}")
+
+                            # (b.3) theta_prev from previous q (warm-start stabilizer)
+                            try:
+                                th_prev_all = np.asarray(get_block(reg, q_i_prev, "theta"), dtype=np.float32).reshape(N, M_theta)
+                                theta_prev = np.asarray(th_prev_all[rid, :M_use], dtype=np.float32).reshape(-1)
+                            except Exception:
+                                theta_prev = np.full((M_use,), 1.0 / float(M_use), dtype=np.float32)
+
+                            # initial theta: start from theta_prev (stable) instead of random
+                            theta = theta_prev.copy()
+    
+                        
+                        frontier_xyz = getattr(problem, "frontier_pts", None)
+                        if frontier_xyz is not None:
+                            front_costs = frontier_distance_costs(
+                                candidates_xyz=candidates,
+                                frontier_xyz=frontier_xyz,
+                                w_front=float(getattr(params, "w_front", 0.6)),
+                                d_scale=float(getattr(params, "front_d_scale", 25.0)),
+                                chunk=256
+                            )
+                        else:
+                            front_costs = np.zeros((M_i,), dtype=np.float32)
+
+                        # c = np.zeros((M_use,), dtype=np.float32)
+                        # for idx in range(M_use):
+                        #     cand = candidates[idx]
+                        #     # eta=0 to disable cost_admm_quadratic inside pos_candidate_score
+                        #     cc, _info = pos_candidate_score(
+                        #         rid=rid,
+                        #         cand=cand,
+                        #         robot_pos=problem.robot_pos,
+                        #         target=current_pos,          # unused when eta=0
+                        #         current_pos=current_pos,
+                        #         problem=problem,
+                        #         eta=0.0,
+                        #         idx=idx,
+                        #         caps=caps
+                        #     )
+                        #     cc = float(cc) + float(front_costs[idx]) if idx < front_costs.size else float(cc)
+                        #     c[idx] = float(cc)
+                        # (b.4) Build linear local cost c_m for candidates.
+                        # IMPORTANT: set eta=0.0 here to avoid double-counting ADMM quadratic term.
+                        c = np.zeros((M_use,), dtype=np.float32)
+                        for idx in range(M_use):
+                            cand = candidates[idx]
+                            cc, _info = pos_candidate_score(
+                                rid=rid,
+                                cand=cand,
+                                robot_pos=problem.robot_pos,
+                                target=current_pos,          # unused when eta=0
+                                current_pos=current_pos,
+                                problem=problem,
+                                eta=0.0,
+                                idx=idx,
+                                caps=caps
+                            )
+                            cc = float(cc) + (float(front_costs[idx]) if idx < front_costs.size else 0.0)
+                            c[idx] = float(cc)
+                        # # proximal weight for theta
+                        # eta_theta = float(getattr(params, "eta", 1.0)) if params is not None else 1.0
+                        # if (not np.isfinite(eta_theta)) or eta_theta <= 1e-9:
+                        #     eta_theta = 1.0
+                        # th0 = np.asarray(th_tgt[:M_use], dtype=np.float32)
+                        # # theta* = proj_simplex(th0 - c/eta_theta)
+                        # th_un = th0 - (c / float(eta_theta))
+                        # th_sol = proj_simplex(th_un, 1.0).astype(np.float32, copy=False)
+                        # (c) Solve theta-QP using projected gradient descent on simplex.
+                        # eta_y couples theta to consensus target y_tgt; eta_theta stabilizes theta around theta_prev.
+                        eta_base = float(getattr(params, "eta", 1.0)) if params is not None else 1.0
+                        if (not np.isfinite(eta_base)) or eta_base <= 1e-9:
+                            eta_base = 1.0
+
+                        theta_pg_iters = int(getattr(params, "theta_pg_iters", 8)) if params is not None else 8
+                        theta_pg_iters = int(max(1, theta_pg_iters))
+
+                        theta_eta_y = float(getattr(params, "theta_eta_y", 1.0)) if params is not None else 1.0
+                        if not np.isfinite(theta_eta_y):
+                            theta_eta_y = 1.0
+                        # eta_y = float(theta_eta_y) * eta_base  # eta_y = theta_eta_y * params.eta
+                        # eta_y is the coupling strength between Phi*theta and y_tgt.
+                        # In YAVG, the effective residual is scaled by 1/N, so we must use eta_y/(N^2).
+                        eta_y = float(theta_eta_y) * eta_base
+                        if YAVG:
+                            N_all = int(getattr(problem, "N", 0) or problem.N)
+                            eta_y = eta_y / float(max(1, N_all * N_all))
+
+                        theta_eta_prior = float(getattr(params, "theta_eta_prior", 0.1)) if params is not None else 0.1
+                        if not np.isfinite(theta_eta_prior):
+                            theta_eta_prior = 0.0
+                        eta_theta = float(theta_eta_prior) * eta_base  # stabilizer
+
+                        theta_step = getattr(params, "theta_step", None) if params is not None else None
+                        if theta_step is None:
+                            # Lipschitz estimate: L = eta_y * ||Phi||^2 + eta_theta.
+                            # Use Frobenius upper bound for speed/stability.
+                            PhiF = float(np.linalg.norm(Phi, ord="fro"))
+                            L = float(eta_y) * (PhiF * PhiF) + float(eta_theta)
+                            step = 1.0 / (L + 1e-6)
+                        else:
+                            step = float(theta_step)
+                            if (not np.isfinite(step)) or step <= 0.0:
+                                step = 1e-2
+
+                        # PGD loop
+                        for _k in range(theta_pg_iters):
+                            # grad = c + eta_y * Phi^T (Phi theta - y_tgt) + eta_theta (theta - theta_prev)
+                            resid_y = (Phi @ theta) - y_tgt               # (dy,)
+                            grad = c + (eta_y * (Phi.T @ resid_y))       # (M_use,)
+                            if eta_theta > 0.0:
+                                grad = grad + eta_theta * (theta - theta_prev)
+                            theta = proj_simplex(theta - step * grad, 1.0).astype(np.float32, copy=False)
+
+                        th_sol = theta  # final solution
+
+                        # pad to M_theta
+                        th_row = np.zeros((M_theta,), dtype=np.float32)
+                        th_row[:M_use] = th_sol
+
+                        # pos_i = sum_m theta_m * cand_m
+                        # (d.2) pos_i = sum_m theta_m * cand_m
+                        # Meaning: replaces greedy best-candidate. This is the convexified action.
+                        pos_new = (th_sol.reshape(-1, 1) * candidates[:M_use, :coord_dim]).sum(axis=0).astype(np.float32)
+
+                        # write theta block (only row rid)
+                        th_all2 = np.asarray(get_block(reg, q_i_new, "theta"), dtype=np.float32).reshape(N, M_theta).copy()
+                        th_all2[rid, :] = th_row
+                        # set_block(reg, q_i_new, "theta", th_all2.reshape(-1))
+                        set_block(reg, q_i_new, "theta", th_all2)  # (N,M_theta)
+
+                        # (d.3) y_hat MUST be written as Phi @ theta (closed loop):
+                        # Meaning: y_hat is no longer a post-hoc heuristic of pos;
+                        # it becomes a deterministic function of theta, so z_eq consensus can
+                        # "pull back" theta through y_tgt in the next iteration (KKT-consistent).
+                        # y_hat_pref = (Phi @ th_sol).astype(np.float32, copy=False).reshape(-1)
+
+                        # # Optional damping toward ADMM target y_tgt (do NOT recompute y_hat from pos)
+                        # damp = bool(getattr(flags, "enable_qstep_damped_y_hat", False))
+                        # y_box_only = bool(getattr(flags, "theory_y_hat_box_only", False))
+                        # use_box = theory_mode and y_box_only
+                        # if damp:
+                        #     beta = float(getattr(params, "y_hat_beta", 1.0)) if params is not None else 1.0
+                        #     if not np.isfinite(beta):
+                        #         beta = 1.0
+                        #     beta = float(np.clip(beta, 0.0, 1.0))
+                        #     y_mix = (1.0 - beta) * y_tgt + beta * y_hat_pref
+                        #     if use_box:
+                        #         y_hat_final = np.clip(np.asarray(y_mix, dtype=np.float32), 0.0, 1.0)
+                        #     else:
+                        #         y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_mix)
+                        # else:
+                        #     y_hat_final = y_hat_pref
+                        # set_block(reg, q_i_new, "y_hat", np.asarray(y_hat_final, dtype=np.float32))
+                        # (d) Strict average-assembly writeback:
+                        # In YAVG mode:
+                        #   - write s_hat_i = Phi @ theta into q (explicit local contribution)
+                        #   - DO NOT write q.y_hat (y_hat is a z-variable)  [Hard constraint A/C]
+                        # In non-YAVG mode:
+                        #   - keep legacy Route-B behavior: q.y_hat = Phi @ theta (optionally damped)
+                        y_hat_pref = (Phi @ th_sol).astype(np.float32, copy=False).reshape(-1)  # keep for debug/r_hat proxy
+                        if YAVG:
+                            s_all = np.asarray(get_block(reg, q_i_new, "s_hat"), dtype=np.float32).reshape(N, dy).copy()
+                            s_all[rid, :] = y_hat_pref  # s_hat_i := Phi theta
+                            set_block(reg, q_i_new, "s_hat", s_all)
+                        else:
+                            damp = bool(getattr(flags, "enable_qstep_damped_y_hat", False))
+                            y_box_only = bool(getattr(flags, "theory_y_hat_box_only", False))
+                            use_box = theory_mode and y_box_only
+                            if damp:
+                                beta = float(getattr(params, "y_hat_beta", 1.0)) if params is not None else 1.0
+                                if not np.isfinite(beta):
+                                    beta = 1.0
+                                beta = float(np.clip(beta, 0.0, 1.0))
+                                y_mix = (1.0 - beta) * y_tgt + beta * y_hat_pref
+                                if use_box:
+                                    y_hat_final = np.clip(np.asarray(y_mix, dtype=np.float32), 0.0, 1.0)
+                                else:
+                                    y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_mix)
+                            else:
+                                y_hat_final = y_hat_pref
+                            set_block(reg, q_i_new, "y_hat", np.asarray(y_hat_final, dtype=np.float32))
+
+
+                        used_theta_qp = True
+
+
+                    # write pos block (only row rid)
+                    pos_all = np.asarray(get_block(reg, q_i_new, "pos"), dtype=np.float32).reshape(N, coord_dim).copy()
+                    pos_all[rid, :] = pos_new.reshape(coord_dim)
+                    set_block(reg, q_i_new, "pos", pos_all.reshape(-1))
+                    # --- after have th_sol aned c ---
+                    dbg = getattr(problem, "_theta_dbg", None)
+                    if dbg is None:
+                        dbg = {}
+                        setattr(problem, "_theta_dbg", dbg)
+
+                    eps = 1e-12
+                    H = float(-np.sum(th_sol * np.log(th_sol + eps)))
+                    max_th = float(np.max(th_sol))
+                    argmax = int(np.argmax(th_sol))
+
+                    # theta_prev (for inertia)
+                    try:
+                        th_prev_all = np.asarray(get_block(reg, q_i_prev, "theta"), np.float32).reshape(N, M_theta)
+                        th_prev = np.asarray(th_prev_all[rid], np.float32).reshape(-1)[:M_use]
+                    except Exception:
+                        th_prev = th_sol.copy()
+                    delta_l2 = float(np.linalg.norm(th_sol - th_prev))
+
+                    # (optional but recommended) build Phi and y_tgt for logging
+                    try:
+                        Phi = coverage_metrics.candidate_y_features(problem, rid, candidates[:M_use], reg, flags)  # (dy, M_use)
+
+                        # IMPORTANT: use the SAME y_tgt that theta-QP used above.
+                        # - non-YAVG: y_tgt came from (z-u)_y_hat
+                        # - YAVG:     y_tgt came from y_tgt_override (solver-provided)
+                        y_tgt_dbg = np.asarray(y_tgt, np.float32).reshape(-1)
+
+                        y_pred = Phi @ th_sol
+                        res_y = float(np.linalg.norm(y_pred - y_tgt_dbg, ord=2))
+
+                        eta_y = float(getattr(params, "theta_eta_y", 1.0)) * float(getattr(params, "eta", 1.0))
+                        if YAVG:
+                            eta_y = eta_y / float(N * N)   # keep consistent with theta-QP gradient scaling
+
+                        pull = float(eta_y * np.linalg.norm(Phi.T @ (y_pred - y_tgt_dbg), ord=2))
+
+                    except Exception:
+                        res_y = float("nan")
+                        pull = float("nan")
+                    c_std = float(np.std(c))
+                    c_rng = float(np.max(c) - np.min(c))
+                    ratio = float(pull / (c_std + 1e-6)) if np.isfinite(pull) else float("nan")
+
+                    dbg[rid] = {
+                        "H": H,
+                        "max_th": max_th,
+                        "argmax": argmax,
+                        "delta_l2": delta_l2,
+                        "res_y": res_y,
+                        "pull": pull,
+                        "c_std": c_std,
+                        "c_rng": c_rng,
+                        "ratio": ratio,
+                    }
+                except Exception:
+                    fallback_legacy = True
+                    used_theta_qp = False
+
+            # ---------- legacy enumeration ----------
+            # else:
+            if (not enable_theta) or fallback_legacy:
+                try:
+                    target_all = decode_pos(reg, z_minus_u, N, problem.coord_dim)
+                except Exception:
+                    target_all = decode_pos(reg, np.asarray(z, dtype=np.float32), N, problem.coord_dim)
+                target = np.asarray(target_all[rid], dtype=np.float32).reshape(coord_dim)
+                eta = float(getattr(params, "eta", 1.0)) if params is not None else 1.0
+
+
+            # caps, hops = capacity_for_rid_candidates_minlen_src(
+            #     rid, candidates, problem.robot_pos, params.los_max_dist, problem.is_los_fn, params.C_max
+            # )
+
+                best_idx: int = 0
+                best_cost: Optional[float] = None
+                best_info = None
+
+            # front_costs = None
+            # frontier_xyz = problem.frontier_pts
+            # front_costs = frontier_distance_costs(candidates_xyz=candidates, frontier_xyz=frontier_xyz, w_front=0.6, d_scale=25.0, chunk=256)
+
+                frontier_xyz = getattr(problem, "frontier_pts", None)
+                if frontier_xyz is not None:
+                    front_costs = frontier_distance_costs(candidates_xyz=candidates, frontier_xyz=frontier_xyz, w_front=0.6, d_scale=25.0, chunk=256)
                 else:
-                    if (c < best_cost) or (c == best_cost and idx < best_idx):
+                    front_costs = np.zeros((candidates.shape[0],), dtype=np.float32)
+
+
+            # for idx in range(int(candidates.shape[0])):
+            #     cand = candidates[idx]
+            #     c, info = pos_candidate_score(
+            #         rid=rid,
+            #         cand=cand,
+            #         robot_pos=problem.robot_pos,
+            #         target=target,
+            #         current_pos=current_pos,
+            #         problem=problem,
+            #         eta=eta,
+            #         idx=idx,
+            #         caps=caps
+            #     )
+            #     c += front_costs[idx]
+            #     # print(f"total cost is : {c}")
+            #     if best_cost is None:
+            #         best_cost = c
+            #         best_idx = idx
+            #         best_info = info
+            #     else:
+            #         if (c < best_cost) or (c == best_cost and idx < best_idx):
+            #             best_cost = c
+            #             best_idx = idx
+            #             best_info = info
+            # best = np.asarray(candidates[best_idx], dtype=np.float32).reshape(coord_dim)
+                for idx in range(int(candidates.shape[0])):
+                    cand = candidates[idx]
+                    c, info = pos_candidate_score(
+                        rid=rid,
+                        cand=cand,
+                        robot_pos=problem.robot_pos,
+                        target=target,
+                        current_pos=current_pos,
+                        problem=problem,
+                        eta=eta,
+                        idx=idx,
+                        caps=caps
+                    )
+                    c += float(front_costs[idx]) if idx < front_costs.size else 0.0
+                    if best_cost is None:
                         best_cost = c
                         best_idx = idx
-            best = np.asarray(candidates[best_idx], dtype=np.float32).reshape(coord_dim)
-            pos_all = np.asarray(decode_pos(reg, np.asarray(z, dtype=np.float32), N, problem.coord_dim), dtype=np.float32)
-            pos_all = pos_all.copy()
-            # if pos_all.ndim == coord_dim and pos_all.shape[0] > rid:
-            if pos_all.ndim == 2 and pos_all.shape[0] > rid and pos_all.shape[1] == coord_dim:
-                pos_all[rid] = best
+                        best_info = info
+                    else:
+                        if (c < best_cost) or (c == best_cost and idx < best_idx):
+                            best_cost = c
+                            best_idx = idx
+                            best_info = info
+                pos_new = np.asarray(candidates[best_idx], dtype=np.float32).reshape(coord_dim)
+                pos_all = np.asarray(get_block(reg, q_i_new, "pos"), dtype=np.float32).reshape(N, coord_dim).copy()
+                pos_all[rid] = pos_new
                 set_block(reg, q_i_new, "pos", pos_all.reshape(-1))
+            # if rid == 2: 
+            #     print(best_info)
+            #     print(front_costs[idx])
+            # pos_all = np.asarray(decode_pos(reg, np.asarray(z, dtype=np.float32), N, problem.coord_dim), dtype=np.float32)
+            # pos_all = pos_all.copy()
+            # # if pos_all.ndim == coord_dim and pos_all.shape[0] > rid:
+            # if pos_all.ndim == 2 and pos_all.shape[0] > rid and pos_all.shape[1] == coord_dim:
+            #     pos_all[rid] = best
+            #     set_block(reg, q_i_new, "pos", pos_all.reshape(-1))
     
     # --- Other blocks ---
     # 1) y_hat: coverage preference
+    # y_hat_pref: Optional[np.ndarray] = None
+    # y_hat_final: Optional[np.ndarray] = None
+    # NOTE:
+    #   If Route-B theta-QP was used, y_hat has already been written as Phi@theta above,
+    #   and we must NOT overwrite it with a post-hoc heuristic y_hat(pos_new).
+    #   Otherwise, the theta<->y_hat coupling channel is broken.
+    # if not used_theta_qp:
     y_hat_pref: Optional[np.ndarray] = None
     y_hat_final: Optional[np.ndarray] = None
-    if ("y_hat" in reg.names()) and bool(getattr(flags, "enable_qstep_update_y_hat", True)):
+
+    # if ("y_hat" in reg.names()) and bool(getattr(flags, "enable_qstep_update_y_hat", True)):
+    # In YAVG, q-step MUST NOT write q.y_hat at all (Hard constraint A).
+    if (not disable_q_y_hat) and ("y_hat" in reg.names()) and bool(getattr(flags, "enable_qstep_update_y_hat", True)):
         try:
-            raw_scores = coverage_metrics.coverage_group_scores(problem, rid, best)
-            y_hat_pref = coverage_metrics.normalize_to_simplex_nonneg(raw_scores)
-
-            damp = bool(getattr(flags, "enable_qstep_damped_y_hat", False))
-
-            if damp:
-                # anchor on ADMM target (z - ui)
-                z_minus_u = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32))
-                y_tgt = np.asarray(get_block(reg, z_minus_u, "y_hat"), dtype=np.float32).reshape(-1)
-                beta = float(getattr(params, "y_hat_beta", 1.0))
-                if not np.isfinite(beta):
-                    beta = 1.0
-                beta = float(np.clip(beta, 0.0, 1.0))
-                y_mix = (1.0 - beta) * y_tgt + beta * y_hat_pref
-                y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_mix)
+            if used_theta_qp:
+                pass
             else:
-                y_hat_final = np.asarray(y_hat_pref, dtype=np.float32).reshape(-1)
-            set_block(reg, q_i_new, "y_hat", np.asarray(y_hat_final, dtype=np.float32))
+                # raw_scores = coverage_metrics.coverage_group_scores(problem, rid, best)
+                # raw_scores = coverage_metrics.coverage_group_scores(problem, rid, pos_new)
+                # y_hat_pref = coverage_metrics.normalize_to_simplex_nonneg(raw_scores)
+                # NOTE: best is the chosen/convexified position used above
+                raw_scores = coverage_metrics.coverage_group_scores(problem, rid, pos_new)
+
+                G = int(getattr(problem, "G", 0) or 0)
+                dy = int(np.prod(reg.shape("y_hat")))
+                T = 1 if (G <= 0 or dy == G) else int(dy // G)
+
+                theory_mode = bool(getattr(flags, "enable_theory_mode", False))
+                # Route-B: theta convex
+                y_box_only = bool(getattr(flags, "theory_y_hat_box_only", False))
+                use_box = theory_mode and y_box_only
+
+                # group-wise base vector (G,)
+                y_g = (
+                    coverage_metrics.normalize_to_box01_nonneg(raw_scores)
+                    if use_box
+                    else coverage_metrics.normalize_to_simplex_nonneg(raw_scores)
+                )
+
+                # expand to (G*T,) in g-major order
+                y_hat_pref = coverage_metrics.expand_y_hat_time_stacked(
+                    y_g, G=G, T=T, simplex_total=(not use_box)
+                )
+                damp = bool(getattr(flags, "enable_qstep_damped_y_hat", False))
+
+                if damp:
+                    # anchor on ADMM target (z - ui)
+                    z_minus_u = (np.asarray(z, dtype=np.float32) - np.asarray(u_i, dtype=np.float32))
+                    y_tgt = np.asarray(get_block(reg, z_minus_u, "y_hat"), dtype=np.float32).reshape(-1)
+                    beta = float(getattr(params, "y_hat_beta", 1.0))
+                    if not np.isfinite(beta):
+                        beta = 1.0
+                    beta = float(np.clip(beta, 0.0, 1.0))
+                    y_mix = (1.0 - beta) * y_tgt + beta * y_hat_pref
+                    # y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_mix)
+                    if use_box:
+                        y_hat_final = np.clip(np.asarray(y_mix, dtype=np.float32), 0.0, 1.0)
+                    else:
+                        # simplex over full dy dims (sum=1), compatible with GT too
+                        y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_mix)
+                else:
+                    y_hat_final = np.asarray(y_hat_pref, dtype=np.float32).reshape(-1)                
+                set_block(reg, q_i_new, "y_hat", np.asarray(y_hat_final, dtype=np.float32))
         except Exception:
             y_hat_pref = None
             y_hat_final = None
@@ -789,11 +1371,26 @@ def solve_local_q(
             damp_s = bool(getattr(flags, "enable_qstep_damped_sigma", False))
 
             # choose y reference: prefer y_hat_final (after damping), else current block
-            if y_hat_final is None and ("y_hat" in reg.names()):
+            if y_hat_final is None and ("y_hat" in reg.names()) and (not disable_q_y_hat):
                 y_hat_final = np.asarray(get_block(reg, q_i_new, "y_hat"), dtype=np.float32).reshape(-1)
-                y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_hat_final)
-
+                # y_hat_final = coverage_metrics.normalize_to_simplex_nonneg(y_hat_final)
+                theory_mode = bool(getattr(flags, "enable_theory_mode", False))
+                use_box = theory_mode and bool(getattr(flags, "theory_y_hat_box_only", False))
+                # y_hat_final = np.clip(y_hat_final, 0.0, 1.0) if use_box else coverage_metrics.normalize_to_simplex_nonneg(y_hat_final)
+                # Meaning: in theory box-mode, do NOT simplex-normalize y_hat; keep it in [0,1].
+                y_hat_final = np.clip(y_hat_final, 0.0, 1.0) if use_box else coverage_metrics.normalize_to_simplex_nonneg(y_hat_final)
+            if y_hat_final is None and ("y_hat" in reg.names()) and disable_q_y_hat:
+                y_hat_final = np.asarray(get_block(reg, z, "y_hat"), dtype=np.float32).reshape(-1)
+ 
             if y_hat_final is not None:
+                # sigma_pref = coverage_metrics.sigma_target_from_y_hat(y_hat_final, params, flags)
+                # IMPORTANT: y_hat may be (G*T,), but sigma is (G,)
+                # Make G visible to coverage_metrics (minimal-invasive)
+                try:
+                    setattr(flags, "G", int(getattr(problem, "G", 0) or 0))
+                    setattr(flags, "sigma_y_reduce", "max")
+                except Exception:
+                    pass
                 sigma_pref = coverage_metrics.sigma_target_from_y_hat(y_hat_final, params, flags)
 
                 if damp_s:
@@ -810,6 +1407,7 @@ def solve_local_q(
                     # optional: enforce coupled lower bound early (z-step will enforce again)
                     sigma_max = float(getattr(params, "sigma_max", 1.0))
                     if bool(getattr(flags, "enable_sigma_coupled_to_y", True)):
+                        # lo = coverage_metrics.sigma_lower_bound_from_y_hat(y_hat_final, params, flags)
                         lo = coverage_metrics.sigma_lower_bound_from_y_hat(y_hat_final, params, flags)
                         sigma_new = np.clip(sigma_mix, lo, sigma_max)
                     else:

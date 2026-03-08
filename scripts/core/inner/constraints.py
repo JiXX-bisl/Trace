@@ -82,6 +82,9 @@ def build_constraints(
     out: Dict[str, List[object]] = {name: [] for name in reg.names()}
     flags = getattr(problem, "flags", None)
 
+    theory_mode = bool(getattr(flags, "enable_theory_mode", False))
+    theory_y_box_only = bool(getattr(flags, "theory_y_hat_box_only", False))
+
     # common parameters
     cap: Optional[np.ndarray] = None
     if ("f_hat" in reg.names()) or ("B_hat" in reg.names()):
@@ -135,24 +138,47 @@ def build_constraints(
             out[name] = cons
         elif name == "y_hat":
             # Stage 1: simplex with sum=1
-            cons = [make_simplex(dim=dim, sum_to=1.0)]
-            cons.append(make_box(0.0, 1.0, dim))
-            out[name] = cons
+            if theory_mode:
+                out[name] = [make_box(0.0, 1.0, dim)]
+            else:
+                cons = [make_simplex(dim=dim, sum_to=1.0)]
+                cons.append(make_box(0.0, 1.0, dim))
+                out[name] = cons
         elif name == "sigma":
-            if bool(getattr(flags, "enable_sigma_coupled_to_y", True)):
-                y_hat = z_blocks.get("y_hat", None)
-                if y_hat is None:
-                   out[name] = [make_box(0.0, sigma_max, dim)]
-                else:
-                    try:
-                        lo = coverage_metrics.sigma_lower_bound_from_y_hat(
-                            np.asarray(y_hat, dtype=np.float32).reshape(-1),
-                            getattr(problem, "params", None),
-                            flags
-                        )
-                        out[name] = [make_box(lo, sigma_max, dim)]
-                    except Exception:
+            # sigma is a coupled macro statistic. Under theory/joint-polytope mode,
+            # the (y_hat, sigma) coupling is enforced by joint projection Π_P, so
+            # sigma's *independent* constraint is just a box [0, sigma_max].
+            joint_poly = bool(getattr(flags, "enable_sigma_y_joint_polytope", False))
+            if theory_mode or joint_poly:
+                out[name] = [make_box(0.0, sigma_max, dim)]
+            else:
+                if bool(getattr(flags, "enable_sigma_coupled_to_y", True)):
+                    y_hat = z_blocks.get("y_hat", None)
+                    if y_hat is None:
                         out[name] = [make_box(0.0, sigma_max, dim)]
+                    else:
+                        try:
+                            # NOTE: sigma_lower_bound_from_y_hat can optionally reduce
+                            # time-stacked y_hat when flags.G is provided by the caller.
+                            lo = coverage_metrics.sigma_lower_bound_from_y_hat(
+                                np.asarray(y_hat, dtype=np.float32).reshape(-1),
+                                getattr(problem, "params", None),
+                                flags,
+                            )
+                            out[name] = [make_box(lo, sigma_max, dim)]
+                        except Exception:
+                            out[name] = [make_box(0.0, sigma_max, dim)]
+                else:
+                    out[name] = [make_box(0.0, sigma_max, dim)]
+        elif name == "theta":
+            # Route-B: theta is enforced in q-step by proj_simplex; here we only add a conservative box
+            # for validation/diagnostics. In theory_mode, z-step freezes theta so this box won't interfere.
+            out[name] = [make_box(0.0, 1.0, dim)]
+        elif name == "s_hat":
+            # Strict theory alignment: local coverage contribution s_i (stacked by robot).
+            # q-step writes s_i = Phi_i @ theta_i; here we only add a conservative box [0,1]^dim
+            # for validation/diagnostics (no simplex; do not interfere with theta-QP).
+            out[name] = [make_box(0.0, 1.0, dim)]
         elif name == "r_hat":
             cons = [make_box(r_min, r_max, dim)]
             if R_total is not None:
@@ -169,6 +195,7 @@ def build_constraints(
         "y_hat": "enable_proj_y_hat",
         "sigma": "enable_proj_sigma",
         "r_hat": "enable_proj_r_hat",
+        "s_hat": "enable_proj_s_hat"
     }
 
     for blk, attr in proj_gate.items():
